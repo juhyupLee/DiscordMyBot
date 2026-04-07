@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.log
+bot.log
+attachments/
+channel_sessions.json
+channel_workdirs.json
+service_stdout*.log
+service_stderr*.log
+WorkMD/
+.claude/
