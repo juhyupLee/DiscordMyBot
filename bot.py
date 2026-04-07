@@ -172,7 +172,7 @@ async def run_claude(prompt: str, work_dir: str, channel_id: int = 0, image_path
         proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
         if channel_id:
             channel_procs[channel_id] = proc
-        stdout, stderr = await asyncio.wait_for(proc.communicate(input=prompt.encode("utf-8")), timeout=300)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(input=prompt.encode("utf-8")), timeout=1800)
         channel_procs.pop(channel_id, None)
         raw = stdout.decode("utf-8", errors="replace").strip()
 
