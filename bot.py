@@ -10,7 +10,9 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
-LOG_FILE = os.path.join(os.path.dirname(__file__), "bot.log")
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "bot.log")
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s: %(message)s",
@@ -139,14 +141,24 @@ def create_bot() -> commands.Bot:
     return bot
 
 
-async def run_claude(prompt: str, work_dir: str, channel_id: int = 0, image_paths: list[str] | None = None) -> str:
-    """claude CLI를 subprocess로 실행. channel_id가 있으면 해당 채널의 세션을 이어감."""
+TOOL_ICONS = {
+    "Read": "📖", "Write": "✏️", "Edit": "✏️", "Bash": "⚡",
+    "Glob": "🔍", "Grep": "🔍", "TodoWrite": "📋", "WebSearch": "🌐",
+    "WebFetch": "🌐",
+}
+
+
+async def run_claude(prompt: str, work_dir: str, channel_id: int = 0,
+                     image_paths: list[str] | None = None,
+                     status_channel: discord.TextChannel | None = None) -> str:
+    """claude CLI를 stream-json으로 실행. 중간 도구 사용 상태를 Discord에 표시."""
 
     cmd = [
         CLAUDE_PATH,
         "--dangerously-skip-permissions",
         "-p", "-",
-        "--output-format", "json",
+        "--output-format", "stream-json",
+        "--verbose",
     ]
 
     # 이미지가 있으면 attachments 디렉토리 접근 허용
@@ -160,39 +172,115 @@ async def run_claude(prompt: str, work_dir: str, channel_id: int = 0, image_path
     logger.info(f"Claude CMD: {' '.join(cmd[:6])}... | cwd={work_dir} | images={bool(image_paths)}")
 
     try:
+        env = os.environ.copy()
+        env["ANDROID_HOME"] = r"C:\Program Files\Unity\Hub\Editor\6000.3.10f1\Editor\Data\PlaybackEngines\AndroidPlayer\SDK"
+        env["JAVA_HOME"] = r"C:\Program Files\Unity\Hub\Editor\6000.3.10f1\Editor\Data\PlaybackEngines\AndroidPlayer\OpenJDK"
+
         kwargs = dict(
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=work_dir,
+            env=env,
         )
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-        proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
+        proc = await asyncio.create_subprocess_exec(*cmd, limit=1024*1024, **kwargs)
         if channel_id:
             channel_procs[channel_id] = proc
-        stdout, stderr = await asyncio.wait_for(proc.communicate(input=prompt.encode("utf-8")), timeout=1800)
+
+        # stdin에 프롬프트를 보내고 닫음
+        proc.stdin.write(prompt.encode("utf-8"))
+        await proc.stdin.drain()
+        proc.stdin.close()
+
+        result_text = ""
+        new_session_id = None
+        status_msg = None  # 상태 메시지 (계속 수정)
+
+        async def read_stream():
+            nonlocal result_text, new_session_id, status_msg
+            while True:
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=1800)
+                if not line:
+                    break
+                line = line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+                msg_type = data.get("type", "")
+
+                # 도구 사용 / 텍스트 미리보기 → Discord에 상태 표시
+                if msg_type == "assistant" and status_channel:
+                    for content in data.get("message", {}).get("content", []):
+                        status = None
+
+                        if content.get("type") == "tool_use":
+                            tool_name = content.get("name", "")
+                            tool_input = content.get("input", {})
+                            icon = TOOL_ICONS.get(tool_name, "🔧")
+
+                            if tool_name in ("Read",):
+                                detail = tool_input.get("file_path", "")
+                                status = f"{icon} `{tool_name}` {os.path.basename(detail)}"
+                            elif tool_name in ("Write", "Edit"):
+                                detail = tool_input.get("file_path", "")
+                                status = f"{icon} `{tool_name}` {os.path.basename(detail)}"
+                            elif tool_name == "Bash":
+                                detail = tool_input.get("command", "")[:60]
+                                status = f"{icon} `{tool_name}` `{detail}`"
+                            elif tool_name in ("Glob", "Grep"):
+                                pattern = tool_input.get("pattern", "")
+                                status = f"{icon} `{tool_name}` {pattern}"
+                            else:
+                                status = f"{icon} `{tool_name}`"
+
+                        elif content.get("type") == "text":
+                            text = content.get("text", "").strip()
+                            if text:
+                                preview = text[:100] + ("..." if len(text) > 100 else "")
+                                status = f"💬 {preview}"
+
+                        if status:
+                            try:
+                                if status_msg:
+                                    await status_msg.edit(content=status)
+                                else:
+                                    status_msg = await status_channel.send(status)
+                            except Exception:
+                                pass
+
+                # 최종 결과 추출
+                if msg_type == "result":
+                    result_text = data.get("result", "")
+                    new_session_id = data.get("session_id")
+
+        await read_stream()
+        await proc.wait()
         channel_procs.pop(channel_id, None)
-        raw = stdout.decode("utf-8", errors="replace").strip()
 
-        # JSON 출력에서 session_id와 result 추출
-        try:
-            data = json.loads(raw)
-            if "session_id" in data and channel_id:
-                channel_sessions[channel_id] = data["session_id"]
-                save_sessions()
-            output = data.get("result", raw)
-        except (json.JSONDecodeError, TypeError):
-            output = raw
+        # 상태 메시지 삭제
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
 
-        if not output and stderr:
-            output = f"[stderr]\n{stderr.decode('utf-8', errors='replace').strip()}"
-        return output or "(빈 응답)"
+        # 세션 저장
+        if new_session_id and channel_id:
+            channel_sessions[channel_id] = new_session_id
+            save_sessions()
+
+        return result_text or "(빈 응답)"
     except asyncio.TimeoutError:
         proc.kill()
         channel_procs.pop(channel_id, None)
-        return "⏰ 타임아웃: 5분을 초과했습니다."
+        return "⏰ 타임아웃: 30분을 초과했습니다."
     except FileNotFoundError:
         return f"claude CLI를 찾을 수 없습니다: {CLAUDE_PATH}"
     except Exception as e:
@@ -226,7 +314,7 @@ async def _process_channel(ch_id: int, prompt: str, message: discord.Message, im
         try:
             work_dir = channel_workdirs.get(ch_id, WORKING_DIR)
             async with message.channel.typing():
-                result = await run_claude(prompt, work_dir, channel_id=ch_id, image_paths=image_paths)
+                result = await run_claude(prompt, work_dir, channel_id=ch_id, image_paths=image_paths, status_channel=message.channel)
             for chunk in split_message(result):
                 await message.reply(f"```\n{chunk}\n```")
         except asyncio.CancelledError:
@@ -358,7 +446,7 @@ def _register_events(bot: commands.Bot):
 
         work_dir = channel_workdirs.get(ctx.channel.id, WORKING_DIR)
         async with ctx.typing():
-            result = await run_claude(prompt, work_dir, channel_id=ctx.channel.id, image_paths=image_paths)
+            result = await run_claude(prompt, work_dir, channel_id=ctx.channel.id, image_paths=image_paths, status_channel=ctx.channel)
 
         for chunk in split_message(result):
             await ctx.reply(f"```\n{chunk}\n```")
