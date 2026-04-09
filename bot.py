@@ -37,6 +37,8 @@ channel_procs: dict[int, asyncio.subprocess.Process] = {}
 channel_busy: dict[int, bool] = {}
 # 채널별 대기 중인 메시지 큐 (모아서 한 번에 전달)
 channel_pending: dict[int, list[tuple]] = {}  # {channel_id: [(prompt, message, image_paths), ...]}
+# 채널별 현재 작업 상태 텍스트
+channel_status: dict[int, str] = {}
 
 # 채널별 작업 디렉토리 & 세션 (파일에 저장하여 재시작해도 유지)
 WORKDIRS_FILE = os.path.join(os.path.dirname(__file__), "channel_workdirs.json")
@@ -144,132 +146,267 @@ def create_bot() -> commands.Bot:
 TOOL_ICONS = {
     "Read": "📖", "Write": "✏️", "Edit": "✏️", "Bash": "⚡",
     "Glob": "🔍", "Grep": "🔍", "TodoWrite": "📋", "WebSearch": "🌐",
-    "WebFetch": "🌐",
+    "WebFetch": "🌐", "AskUserQuestion": "❓",
 }
 
 
-async def run_claude(prompt: str, work_dir: str, channel_id: int = 0,
-                     image_paths: list[str] | None = None,
-                     status_channel: discord.TextChannel | None = None) -> str:
-    """claude CLI를 stream-json으로 실행. 중간 도구 사용 상태를 Discord에 표시."""
+async def spawn_claude_proc(prompt: str, channel_id: int, work_dir: str,
+                            image_paths: list[str] | None = None) -> asyncio.subprocess.Process:
+    """Claude -p 모드로 프로세스 생성. 매 메시지마다 새 프로세스, --resume으로 세션 유지."""
 
     cmd = [
         CLAUDE_PATH,
         "--dangerously-skip-permissions",
         "-p", "-",
         "--output-format", "stream-json",
+        "--include-partial-messages",
         "--verbose",
+        "--add-dir", ATTACH_DIR,
     ]
-
-    # 이미지가 있으면 attachments 디렉토리 접근 허용
-    if image_paths:
-        cmd += ["--add-dir", ATTACH_DIR]
 
     session_id = channel_sessions.get(channel_id)
     if session_id:
         cmd += ["--resume", session_id]
 
-    logger.info(f"Claude CMD: {' '.join(cmd[:6])}... | cwd={work_dir} | images={bool(image_paths)}")
+    logger.info(f"Claude 프로세스 시작: cwd={work_dir}")
+
+    env = os.environ.copy()
+    env["ANDROID_HOME"] = r"C:\Program Files\Unity\Hub\Editor\6000.3.10f1\Editor\Data\PlaybackEngines\AndroidPlayer\SDK"
+    env["JAVA_HOME"] = r"C:\Program Files\Unity\Hub\Editor\6000.3.10f1\Editor\Data\PlaybackEngines\AndroidPlayer\OpenJDK"
+
+    kwargs = dict(
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=work_dir,
+        env=env,
+    )
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+    proc = await asyncio.create_subprocess_exec(*cmd, limit=1024*1024, **kwargs)
+    channel_procs[channel_id] = proc
+
+    # stdin에 프롬프트 쓰고 닫기 (-p 모드)
+    proc.stdin.write(prompt.encode("utf-8"))
+    await proc.stdin.drain()
+    proc.stdin.close()
+
+    return proc
+
+
+async def run_claude(prompt: str, work_dir: str, channel_id: int = 0,
+                     image_paths: list[str] | None = None,
+                     status_channel: discord.TextChannel | None = None,
+                     reply_to: discord.Message | None = None) -> str:
+    """claude CLI를 대화형 모드로 실행. 스트리밍으로 실시간 응답 표시."""
 
     try:
-        env = os.environ.copy()
-        env["ANDROID_HOME"] = r"C:\Program Files\Unity\Hub\Editor\6000.3.10f1\Editor\Data\PlaybackEngines\AndroidPlayer\SDK"
-        env["JAVA_HOME"] = r"C:\Program Files\Unity\Hub\Editor\6000.3.10f1\Editor\Data\PlaybackEngines\AndroidPlayer\OpenJDK"
+        proc = await spawn_claude_proc(prompt, channel_id, work_dir, image_paths)
 
-        kwargs = dict(
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=work_dir,
-            env=env,
-        )
-        if os.name == "nt":
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-        proc = await asyncio.create_subprocess_exec(*cmd, limit=1024*1024, **kwargs)
-        if channel_id:
-            channel_procs[channel_id] = proc
-
-        # stdin에 프롬프트를 보내고 닫음
-        proc.stdin.write(prompt.encode("utf-8"))
-        await proc.stdin.drain()
-        proc.stdin.close()
-
-        result_text = ""
         new_session_id = None
-        status_msg = None  # 상태 메시지 (계속 수정)
+        status_msg = None          # 도구 상태 표시용 메시지
+        stream_msg = None          # 스트리밍 텍스트 표시용 메시지
+        stream_msgs = []           # 스트리밍 메시지 목록 (분할 시)
+        stream_buf = ""            # 텍스트 누적 버퍼
+        last_edit_time = 0         # 마지막 메시지 edit 시각 (rate limit 방지)
+        EDIT_INTERVAL = 1.0        # 최소 edit 간격 (초)
+        result_text = ""
 
-        async def read_stream():
-            nonlocal result_text, new_session_id, status_msg
-            while True:
-                line = await asyncio.wait_for(proc.stdout.readline(), timeout=1800)
-                if not line:
-                    break
-                line = line.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
+        async def _flush_stream():
+            """버퍼에 쌓인 텍스트를 Discord에 반영"""
+            nonlocal stream_msg, stream_buf, stream_msgs, last_edit_time
+            if not stream_buf or not status_channel:
+                return
+
+            now = asyncio.get_event_loop().time()
+            if now - last_edit_time < EDIT_INTERVAL:
+                return
+
+            # 현재 메시지에 넣을 수 있는 텍스트 (코드블록 포함 1900자)
+            display = stream_buf
+            if len(display) > MAX_MSG_LEN - 10:
+                # 현재 메시지를 확정하고 새 메시지 시작
+                cut = stream_buf[:MAX_MSG_LEN - 10]
+                remainder = stream_buf[MAX_MSG_LEN - 10:]
                 try:
-                    data = json.loads(line)
-                except (json.JSONDecodeError, TypeError):
-                    continue
+                    if stream_msg:
+                        await stream_msg.edit(content=f"```\n{cut}\n```")
+                    else:
+                        send_kwargs = {}
+                        if reply_to:
+                            send_kwargs["reference"] = reply_to
+                        stream_msg = await status_channel.send(f"```\n{cut}\n```", **send_kwargs)
+                    stream_msgs.append(stream_msg)
+                except Exception:
+                    pass
+                stream_msg = None
+                stream_buf = remainder
+                display = remainder
 
-                msg_type = data.get("type", "")
+            try:
+                if stream_msg:
+                    await stream_msg.edit(content=f"```\n{display}\n```")
+                elif display.strip():
+                    send_kwargs = {}
+                    if reply_to and not stream_msgs:
+                        send_kwargs["reference"] = reply_to
+                    stream_msg = await status_channel.send(f"```\n{display}\n```", **send_kwargs)
+            except Exception:
+                pass
+            last_edit_time = now
 
-                # 도구 사용 / 텍스트 미리보기 → Discord에 상태 표시
-                if msg_type == "assistant" and status_channel:
-                    for content in data.get("message", {}).get("content", []):
-                        status = None
+        while True:
+            line = await asyncio.wait_for(proc.stdout.readline(), timeout=1800)
+            if not line:
+                channel_procs.pop(channel_id, None)
+                break
+            line = line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
 
-                        if content.get("type") == "tool_use":
-                            tool_name = content.get("name", "")
-                            tool_input = content.get("input", {})
-                            icon = TOOL_ICONS.get(tool_name, "🔧")
+            msg_type = data.get("type", "")
 
-                            if tool_name in ("Read",):
-                                detail = tool_input.get("file_path", "")
-                                status = f"{icon} `{tool_name}` {os.path.basename(detail)}"
-                            elif tool_name in ("Write", "Edit"):
-                                detail = tool_input.get("file_path", "")
-                                status = f"{icon} `{tool_name}` {os.path.basename(detail)}"
-                            elif tool_name == "Bash":
-                                detail = tool_input.get("command", "")[:60]
-                                status = f"{icon} `{tool_name}` `{detail}`"
-                            elif tool_name in ("Glob", "Grep"):
-                                pattern = tool_input.get("pattern", "")
-                                status = f"{icon} `{tool_name}` {pattern}"
+            if msg_type == "system":
+                continue
+
+            # stream_event: 토큰 단위 스트리밍 (--include-partial-messages)
+            if msg_type == "stream_event" and status_channel:
+                event = data.get("event", {})
+                event_type = event.get("type", "")
+
+                # 텍스트 토큰 도착
+                if event_type == "content_block_delta":
+                    delta = event.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        text = delta.get("text", "")
+                        if text:
+                            if status_msg:
+                                try:
+                                    await status_msg.delete()
+                                    status_msg = None
+                                except Exception:
+                                    pass
+                            stream_buf += text
+                            await _flush_stream()
+
+                # 도구 사용 시작 (input_json_delta로 점진적 도착)
+                elif event_type == "content_block_start":
+                    block = event.get("content_block", {})
+                    if block.get("type") == "tool_use":
+                        tool_name = block.get("name", "")
+                        icon = TOOL_ICONS.get(tool_name, "🔧")
+                        status = f"{icon} `{tool_name}` ..."
+                        await _flush_stream()
+                        if channel_id:
+                            channel_status[channel_id] = status
+                        try:
+                            if status_msg:
+                                await status_msg.edit(content=status)
                             else:
-                                status = f"{icon} `{tool_name}`"
+                                status_msg = await status_channel.send(status)
+                        except Exception:
+                            pass
 
-                        elif content.get("type") == "text":
-                            text = content.get("text", "").strip()
-                            if text:
-                                preview = text[:100] + ("..." if len(text) > 100 else "")
-                                status = f"💬 {preview}"
+                continue
 
-                        if status:
-                            try:
-                                if status_msg:
-                                    await status_msg.edit(content=status)
-                                else:
-                                    status_msg = await status_channel.send(status)
-                            except Exception:
-                                pass
+            # assistant: 완성된 메시지 (도구 상세 정보, AskUserQuestion 감지용)
+            if msg_type == "assistant" and status_channel:
+                for content in data.get("message", {}).get("content", []):
+                    # AskUserQuestion 감지 → 질문 표시 (응답은 다음 메시지로 --resume 통해 전달됨)
+                    if content.get("type") == "tool_use" and content.get("name") == "AskUserQuestion":
+                        question = content.get("input", {}).get("question", "(질문 내용 없음)")
+                        await _flush_stream()
+                        try:
+                            if status_msg:
+                                await status_msg.delete()
+                                status_msg = None
+                            await status_channel.send(f"❓ **Claude가 질문합니다:**\n{question}\n*(답변을 입력하면 다음 메시지로 전달됩니다)*")
+                        except Exception:
+                            pass
+                        continue
 
-                # 최종 결과 추출
-                if msg_type == "result":
-                    result_text = data.get("result", "")
-                    new_session_id = data.get("session_id")
+                    # 도구 사용 → 상태 메시지 업데이트 (상세 정보)
+                    if content.get("type") == "tool_use":
+                        tool_name = content.get("name", "")
+                        tool_input = content.get("input", {})
+                        icon = TOOL_ICONS.get(tool_name, "🔧")
 
-        await read_stream()
-        await proc.wait()
-        channel_procs.pop(channel_id, None)
+                        if tool_name in ("Read",):
+                            detail = tool_input.get("file_path", "")
+                            status = f"{icon} `{tool_name}` {os.path.basename(detail)}"
+                        elif tool_name in ("Write", "Edit"):
+                            detail = tool_input.get("file_path", "")
+                            status = f"{icon} `{tool_name}` {os.path.basename(detail)}"
+                        elif tool_name == "Bash":
+                            detail = tool_input.get("command", "")[:60]
+                            status = f"{icon} `{tool_name}` `{detail}`"
+                        elif tool_name in ("Glob", "Grep"):
+                            pattern = tool_input.get("pattern", "")
+                            status = f"{icon} `{tool_name}` {pattern}"
+                        else:
+                            status = f"{icon} `{tool_name}`"
 
-        # 상태 메시지 삭제
+                        if channel_id:
+                            channel_status[channel_id] = status
+                        try:
+                            if status_msg:
+                                await status_msg.edit(content=status)
+                            else:
+                                status_msg = await status_channel.send(status)
+                        except Exception:
+                            pass
+
+            # 최종 결과
+            if msg_type == "result":
+                result_text = data.get("result", "")
+                new_session_id = data.get("session_id")
+                break
+
+            if msg_type == "rate_limit_event":
+                continue
+
+        # 최종 정리: 상태 메시지 삭제
+        channel_status.pop(channel_id, None)
         if status_msg:
             try:
                 await status_msg.delete()
             except Exception:
                 pass
+
+        # 스트리밍 메시지를 최종 result로 교체
+        if result_text and status_channel:
+            final_chunks = split_message(result_text)
+            # 기존 스트리밍 메시지들 정리
+            if stream_msg and stream_msg not in stream_msgs:
+                stream_msgs.append(stream_msg)
+
+            for i, chunk in enumerate(final_chunks):
+                content = f"```\n{chunk}\n```"
+                if i < len(stream_msgs):
+                    try:
+                        await stream_msgs[i].edit(content=content)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        send_kwargs = {}
+                        if reply_to and i == 0 and not stream_msgs:
+                            send_kwargs["reference"] = reply_to
+                        await status_channel.send(content, **send_kwargs)
+                    except Exception:
+                        pass
+
+            # 남은 스트리밍 메시지 삭제 (final이 더 짧은 경우)
+            for i in range(len(final_chunks), len(stream_msgs)):
+                try:
+                    await stream_msgs[i].delete()
+                except Exception:
+                    pass
 
         # 세션 저장
         if new_session_id and channel_id:
@@ -278,12 +415,19 @@ async def run_claude(prompt: str, work_dir: str, channel_id: int = 0,
 
         return result_text or "(빈 응답)"
     except asyncio.TimeoutError:
-        proc.kill()
-        channel_procs.pop(channel_id, None)
+        proc = channel_procs.pop(channel_id, None)
+        if proc:
+            proc.kill()
         return "⏰ 타임아웃: 30분을 초과했습니다."
     except FileNotFoundError:
         return f"claude CLI를 찾을 수 없습니다: {CLAUDE_PATH}"
     except Exception as e:
+        proc = channel_procs.pop(channel_id, None)
+        if proc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
         return f"오류 발생: {e}"
 
 
@@ -314,9 +458,13 @@ async def _process_channel(ch_id: int, prompt: str, message: discord.Message, im
         try:
             work_dir = channel_workdirs.get(ch_id, WORKING_DIR)
             async with message.channel.typing():
-                result = await run_claude(prompt, work_dir, channel_id=ch_id, image_paths=image_paths, status_channel=message.channel)
-            for chunk in split_message(result):
-                await message.reply(f"```\n{chunk}\n```")
+                result = await run_claude(prompt, work_dir, channel_id=ch_id,
+                                          image_paths=image_paths,
+                                          status_channel=message.channel,
+                                          reply_to=message)
+            # 스트리밍으로 이미 전송됨. 에러/타임아웃 등 특수 경우만 별도 전송
+            if result.startswith("⏰") or result.startswith("오류") or result == "(빈 응답)":
+                await message.reply(f"```\n{result}\n```")
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -360,7 +508,6 @@ async def _handle_message(message: discord.Message, bot: commands.Bot):
 
         # 중지 명령
         if prompt in ("중지", "stop", "멈춰", "esc"):
-            # 대기 메시지도 제거
             channel_pending.pop(ch_id, None)
             proc = channel_procs.pop(ch_id, None)
             if proc:
@@ -373,6 +520,12 @@ async def _handle_message(message: discord.Message, bot: commands.Bot):
         # 리셋 명령
         if prompt in ("리셋", "reset", "새대화"):
             channel_pending.pop(ch_id, None)
+            proc = channel_procs.pop(ch_id, None)
+            if proc:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
             channel_sessions.pop(ch_id, None)
             save_sessions()
             await message.reply("세션 초기화 완료. 새 대화를 시작합니다.")
@@ -380,10 +533,9 @@ async def _handle_message(message: discord.Message, bot: commands.Bot):
 
         prompt, image_paths = await _prepare_prompt(message)
 
-        # 현재 작업 중이면 대기 큐에 추가
+        # 현재 작업 중이면 조용히 대기 큐에 추가 (CLI처럼 자연스럽게)
         if channel_busy.get(ch_id):
             channel_pending.setdefault(ch_id, []).append((prompt, message, image_paths))
-            await message.add_reaction("⏳")
             return
 
         # 작업 시작
@@ -446,10 +598,13 @@ def _register_events(bot: commands.Bot):
 
         work_dir = channel_workdirs.get(ctx.channel.id, WORKING_DIR)
         async with ctx.typing():
-            result = await run_claude(prompt, work_dir, channel_id=ctx.channel.id, image_paths=image_paths, status_channel=ctx.channel)
+            result = await run_claude(prompt, work_dir, channel_id=ctx.channel.id,
+                                      image_paths=image_paths,
+                                      status_channel=ctx.channel,
+                                      reply_to=ctx.message)
 
-        for chunk in split_message(result):
-            await ctx.reply(f"```\n{chunk}\n```")
+        if result.startswith("⏰") or result.startswith("오류") or result == "(빈 응답)":
+            await ctx.reply(f"```\n{result}\n```")
 
     @bot.command(name="cd")
     async def change_dir(ctx: commands.Context, *, path: str):
@@ -460,6 +615,13 @@ def _register_events(bot: commands.Bot):
 
         resolved = os.path.abspath(path)
         if os.path.isdir(resolved):
+            # 기존 프로세스 종료 (새 cwd로 재시작 필요)
+            proc = channel_procs.pop(ctx.channel.id, None)
+            if proc:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
             channel_workdirs[ctx.channel.id] = resolved
             save_workdirs()
             ensure_claude_settings(resolved)
