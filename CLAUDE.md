@@ -50,6 +50,10 @@ Discord 메시지로 Claude Code CLI를 원격 실행하는 봇. 채널별 독�
 - `!cc <프롬프트>` — Claude Code 실행
 - `!cd <경로>` — 채널 작업 디렉토리 변경 (자동으로 .claude/settings.json에 권한 추가)
 - `!pwd` — 현재 채널 작업 디렉토리 확인
+- `!skill list` — 현재 작업 디렉토리의 스킬 목록
+- `!skill show <이름>` — 스킬 내용 보기
+- `!skill create <이름>` + .md 파일 첨부 — 스킬 생성 (Claude Code 권한 우회)
+- `!skill delete <이름>` — 스킬 삭제
 
 ### 커스텀 슬래시 명령
 - `/devlog-push` — DEVLOG.md 갱신 후 git commit + push

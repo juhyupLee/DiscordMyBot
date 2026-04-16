@@ -70,16 +70,49 @@ DEFAULT_PERMISSIONS = ["Bash(*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "
 ATTACH_DIR = os.path.join(os.path.dirname(__file__), "attachments")
 os.makedirs(ATTACH_DIR, exist_ok=True)
 
+ATTACH_MAX_AGE = 24 * 60 * 60  # 첨부파일 보관 기간 (24시간)
+ATTACH_CLEANUP_INTERVAL = 24 * 60 * 60  # 정리 주기 (24시간)
+
+# 재시작 감지용 플래그 파일
+_RESTART_FLAG_FILE = os.path.join(os.path.dirname(__file__), ".bot_running")
+
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+TEXT_EXTS = {".txt", ".md", ".json", ".log", ".csv", ".xml", ".yaml", ".yml",
+             ".py", ".js", ".ts", ".cs", ".java", ".cpp", ".c", ".h", ".bat", ".sh"}
+ALLOWED_EXTS = IMAGE_EXTS | TEXT_EXTS
+
+
+async def cleanup_attachments():
+    """오래된 첨부파일 삭제 (ATTACH_MAX_AGE 초과)"""
+    import time as _time
+    now = _time.time()
+    count = 0
+    try:
+        for fname in os.listdir(ATTACH_DIR):
+            fpath = os.path.join(ATTACH_DIR, fname)
+            if os.path.isfile(fpath) and now - os.path.getmtime(fpath) > ATTACH_MAX_AGE:
+                os.remove(fpath)
+                count += 1
+    except Exception as e:
+        logger.error(f"첨부파일 정리 중 오류: {e}")
+    if count:
+        logger.info(f"오래된 첨부파일 {count}개 삭제")
+
+
+async def _attachment_cleanup_loop():
+    """주기적으로 오래된 첨부파일을 정리하는 백그라운드 루프"""
+    while True:
+        await asyncio.sleep(ATTACH_CLEANUP_INTERVAL)
+        await cleanup_attachments()
 
 
 async def download_attachments(attachments: list[discord.Attachment]) -> list[str]:
-    """Discord 첨부파일 중 이미지를 로컬에 다운로드하고 경로 리스트 반환"""
+    """Discord 첨부파일(이미지+텍스트)을 로컬에 다운로드하고 경로 리스트 반환"""
     paths = []
     async with aiohttp.ClientSession() as session:
         for att in attachments:
             ext = os.path.splitext(att.filename)[1].lower()
-            if ext not in IMAGE_EXTS:
+            if ext not in ALLOWED_EXTS:
                 continue
             local_path = os.path.join(ATTACH_DIR, f"{att.id}_{att.filename}")
             async with session.get(att.url) as resp:
@@ -195,11 +228,36 @@ async def spawn_claude_proc(prompt: str, channel_id: int, work_dir: str,
     return proc
 
 
+MAX_RETRIES = 2
+
 async def run_claude(prompt: str, work_dir: str, channel_id: int = 0,
                      image_paths: list[str] | None = None,
                      status_channel: discord.TextChannel | None = None,
                      reply_to: discord.Message | None = None) -> str:
-    """claude CLI를 대화형 모드로 실행. 스트리밍으로 실시간 응답 표시."""
+    """claude CLI를 대화형 모드로 실행. 스트리밍으로 실시간 응답 표시. API 에러 시 자동 재시도."""
+
+    RETRY_PATTERNS = ["API Error", "Stream idle timeout", "overloaded", "529", "500", "오류 발생"]
+
+    for attempt in range(MAX_RETRIES + 1):
+        result = await _run_claude_once(prompt, work_dir, channel_id, image_paths, status_channel, reply_to)
+        if result and not any(p in result for p in RETRY_PATTERNS):
+            return result
+        if attempt < MAX_RETRIES:
+            logger.warning(f"Claude API 오류, 재시도 {attempt + 1}/{MAX_RETRIES}: {result[:100]}")
+            if status_channel:
+                try:
+                    await status_channel.send(f"⚠️ 응답 실패, 재시도 중... ({attempt + 1}/{MAX_RETRIES})")
+                except Exception:
+                    pass
+            await asyncio.sleep(2)
+    return result
+
+
+async def _run_claude_once(prompt: str, work_dir: str, channel_id: int = 0,
+                           image_paths: list[str] | None = None,
+                           status_channel: discord.TextChannel | None = None,
+                           reply_to: discord.Message | None = None) -> str:
+    """run_claude의 단일 실행. 재시도 로직은 run_claude에서 처리."""
 
     try:
         proc = await spawn_claude_proc(prompt, channel_id, work_dir, image_paths)
@@ -212,6 +270,14 @@ async def run_claude(prompt: str, work_dir: str, channel_id: int = 0,
         last_edit_time = 0         # 마지막 메시지 edit 시각 (rate limit 방지)
         EDIT_INTERVAL = 1.0        # 최소 edit 간격 (초)
         result_text = ""
+        is_thinking = False        # thinking 블록 진행 중 여부
+
+        # 초기 상태 메시지 표시
+        if status_channel:
+            try:
+                status_msg = await status_channel.send("⏳ Claude 처리 중...")
+            except Exception:
+                pass
 
         async def _flush_stream():
             """버퍼에 쌓인 텍스트를 Discord에 반영"""
@@ -260,6 +326,15 @@ async def run_claude(prompt: str, work_dir: str, channel_id: int = 0,
             line = await asyncio.wait_for(proc.stdout.readline(), timeout=1800)
             if not line:
                 channel_procs.pop(channel_id, None)
+                # 프로세스 리소스 정리 (stderr 소비 + wait)
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
                 break
             line = line.decode("utf-8", errors="replace").strip()
             if not line:
@@ -279,12 +354,13 @@ async def run_claude(prompt: str, work_dir: str, channel_id: int = 0,
                 event = data.get("event", {})
                 event_type = event.get("type", "")
 
-                # 텍스트 토큰 도착
+                # 텍스트/thinking 토큰 도착
                 if event_type == "content_block_delta":
                     delta = event.get("delta", {})
                     if delta.get("type") == "text_delta":
                         text = delta.get("text", "")
                         if text:
+                            is_thinking = False
                             if status_msg:
                                 try:
                                     await status_msg.delete()
@@ -293,11 +369,37 @@ async def run_claude(prompt: str, work_dir: str, channel_id: int = 0,
                                     pass
                             stream_buf += text
                             await _flush_stream()
+                    elif delta.get("type") == "thinking_delta":
+                        if not is_thinking:
+                            is_thinking = True
+                            status = "🤔 thinking..."
+                            if channel_id:
+                                channel_status[channel_id] = status
+                            try:
+                                if status_msg:
+                                    await status_msg.edit(content=status)
+                                else:
+                                    status_msg = await status_channel.send(status)
+                            except Exception:
+                                pass
 
-                # 도구 사용 시작 (input_json_delta로 점진적 도착)
+                # 블록 시작 (도구 사용, thinking 등)
                 elif event_type == "content_block_start":
                     block = event.get("content_block", {})
-                    if block.get("type") == "tool_use":
+                    if block.get("type") == "thinking":
+                        is_thinking = True
+                        status = "🤔 thinking..."
+                        if channel_id:
+                            channel_status[channel_id] = status
+                        try:
+                            if status_msg:
+                                await status_msg.edit(content=status)
+                            else:
+                                status_msg = await status_channel.send(status)
+                        except Exception:
+                            pass
+                    elif block.get("type") == "tool_use":
+                        is_thinking = False
                         tool_name = block.get("name", "")
                         icon = TOOL_ICONS.get(tool_name, "🔧")
                         status = f"{icon} `{tool_name}` ..."
@@ -311,6 +413,11 @@ async def run_claude(prompt: str, work_dir: str, channel_id: int = 0,
                                 status_msg = await status_channel.send(status)
                         except Exception:
                             pass
+
+                # thinking 블록 끝
+                elif event_type == "content_block_stop":
+                    if is_thinking:
+                        is_thinking = False
 
                 continue
 
@@ -365,6 +472,33 @@ async def run_claude(prompt: str, work_dir: str, channel_id: int = 0,
             if msg_type == "result":
                 result_text = data.get("result", "")
                 new_session_id = data.get("session_id")
+
+                # 토큰/비용 정보 표시
+                if status_channel:
+                    stats_parts = []
+                    cost = data.get("cost_usd")
+                    if cost is not None:
+                        stats_parts.append(f"💰 ${cost:.4f}")
+                    total_cost = data.get("total_cost_usd")
+                    if total_cost is not None:
+                        stats_parts.append(f"(세션 ${total_cost:.4f})")
+                    duration_ms = data.get("duration_ms")
+                    if duration_ms is not None:
+                        stats_parts.append(f"⏱️ {duration_ms / 1000:.1f}s")
+                    num_turns = data.get("num_turns")
+                    if num_turns is not None:
+                        stats_parts.append(f"🔄 {num_turns}턴")
+                    usage = data.get("usage", {})
+                    input_tokens = usage.get("input_tokens", 0)
+                    output_tokens = usage.get("output_tokens", 0)
+                    if input_tokens or output_tokens:
+                        stats_parts.append(f"📊 {input_tokens:,}→{output_tokens:,} tok")
+                    if stats_parts:
+                        try:
+                            await status_channel.send(" ".join(stats_parts))
+                        except Exception:
+                            pass
+
                 break
 
             if msg_type == "rate_limit_event":
@@ -418,6 +552,14 @@ async def run_claude(prompt: str, work_dir: str, channel_id: int = 0,
         proc = channel_procs.pop(channel_id, None)
         if proc:
             proc.kill()
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+            try:
+                await proc.wait()
+            except Exception:
+                pass
         return "⏰ 타임아웃: 30분을 초과했습니다."
     except FileNotFoundError:
         return f"claude CLI를 찾을 수 없습니다: {CLAUDE_PATH}"
@@ -426,6 +568,14 @@ async def run_claude(prompt: str, work_dir: str, channel_id: int = 0,
         if proc:
             try:
                 proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+            try:
+                await proc.wait()
             except Exception:
                 pass
         return f"오류 발생: {e}"
@@ -447,8 +597,16 @@ async def _prepare_prompt(message: discord.Message) -> tuple[str, list[str]]:
     if message.attachments:
         image_paths = await download_attachments(message.attachments)
     if image_paths:
-        image_refs = "\n".join(f"- {p.replace(os.sep, '/')}" for p in image_paths)
-        prompt = f"{prompt}\n\n[첨부 이미지 - 반드시 Read 도구로 아래 경로를 읽어서 이미지를 확인한 뒤 답변해줘]:\n{image_refs}"
+        images = [p for p in image_paths if os.path.splitext(p)[1].lower() in IMAGE_EXTS]
+        texts = [p for p in image_paths if os.path.splitext(p)[1].lower() in TEXT_EXTS]
+        parts = []
+        if images:
+            refs = "\n".join(f"- {p.replace(os.sep, '/')}" for p in images)
+            parts.append(f"[첨부 이미지 - 반드시 Read 도구로 아래 경로를 읽어서 이미지를 확인한 뒤 답변해줘]:\n{refs}")
+        if texts:
+            refs = "\n".join(f"- {p.replace(os.sep, '/')}" for p in texts)
+            parts.append(f"[첨부 파일 - 반드시 Read 도구로 아래 경로를 읽어서 내용을 확인한 뒤 답변해줘]:\n{refs}")
+        prompt = f"{prompt}\n\n" + "\n\n".join(parts)
     return prompt, image_paths
 
 
@@ -512,6 +670,14 @@ async def _handle_message(message: discord.Message, bot: commands.Bot):
             proc = channel_procs.pop(ch_id, None)
             if proc:
                 proc.kill()
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
                 await message.reply("실행 중인 작업을 중지했습니다.")
             else:
                 await message.reply("실행 중인 작업이 없습니다.")
@@ -524,6 +690,14 @@ async def _handle_message(message: discord.Message, bot: commands.Bot):
             if proc:
                 try:
                     proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
+                try:
+                    await proc.wait()
                 except Exception:
                     pass
             channel_sessions.pop(ch_id, None)
@@ -552,6 +726,27 @@ def _register_events(bot: commands.Bot):
         print(f"봇 로그인 완료: {bot.user}")
         print(f"허용된 유저 ID: {ALLOWED_USER_ID}")
         print(f"작업 디렉토리: {WORKING_DIR}")
+        # 첨부파일 주기적 정리 시작
+        asyncio.create_task(_attachment_cleanup_loop())
+
+        # 비정상 종료 후 재시작 감지 → 알림
+        is_restart = os.path.exists(_RESTART_FLAG_FILE)
+        # 플래그 파일 갱신 (정상 가동 중 표시)
+        try:
+            with open(_RESTART_FLAG_FILE, "w") as f:
+                import time as _t
+                f.write(str(_t.time()))
+        except Exception:
+            pass
+
+        if is_restart and CLAUDE_CATEGORY_ID:
+            try:
+                category = bot.get_channel(CLAUDE_CATEGORY_ID)
+                if category and category.text_channels:
+                    ch = category.text_channels[0]
+                    await ch.send("⚠️ **봇이 비정상 종료 후 자동 재시작되었습니다.**")
+            except Exception as e:
+                logger.error(f"재시작 알림 전송 실패: {e}")
 
     @bot.event
     async def on_disconnect():
@@ -593,8 +788,16 @@ def _register_events(bot: commands.Bot):
             image_paths = await download_attachments(ctx.message.attachments)
 
         if image_paths:
-            image_refs = "\n".join(f"- {p.replace(os.sep, '/')}" for p in image_paths)
-            prompt = f"{prompt}\n\n[첨부 이미지 - 반드시 Read 도구로 아래 경로를 읽어서 이미지를 확인한 뒤 답변해줘]:\n{image_refs}"
+            images = [p for p in image_paths if os.path.splitext(p)[1].lower() in IMAGE_EXTS]
+            texts = [p for p in image_paths if os.path.splitext(p)[1].lower() in TEXT_EXTS]
+            parts = []
+            if images:
+                refs = "\n".join(f"- {p.replace(os.sep, '/')}" for p in images)
+                parts.append(f"[첨부 이미지 - 반드시 Read 도구로 아래 경로를 읽어서 이미지를 확인한 뒤 답변해줘]:\n{refs}")
+            if texts:
+                refs = "\n".join(f"- {p.replace(os.sep, '/')}" for p in texts)
+                parts.append(f"[첨부 파일 - 반드시 Read 도구로 아래 경로를 읽어서 내용을 확인한 뒤 답변해줘]:\n{refs}")
+            prompt = f"{prompt}\n\n" + "\n\n".join(parts)
 
         work_dir = channel_workdirs.get(ctx.channel.id, WORKING_DIR)
         async with ctx.typing():
@@ -637,6 +840,74 @@ def _register_events(bot: commands.Bot):
         work_dir = channel_workdirs.get(ctx.channel.id, WORKING_DIR)
         await ctx.reply(f"`{work_dir}`")
 
+    @bot.command(name="skill")
+    async def manage_skill(ctx: commands.Context, action: str = "list", *, name: str = ""):
+        """!skill list|create|delete|show <이름> — .claude/skills/ 관리. 파일 첨부로 SKILL.md 생성."""
+        if ctx.author.id != ALLOWED_USER_ID:
+            await ctx.reply("권한이 없습니다.")
+            return
+
+        work_dir = channel_workdirs.get(ctx.channel.id, WORKING_DIR)
+        skills_dir = os.path.join(work_dir, ".claude", "skills")
+
+        if action == "list":
+            if not os.path.isdir(skills_dir):
+                await ctx.reply("스킬이 없습니다.")
+                return
+            skill_names = [d for d in os.listdir(skills_dir)
+                          if os.path.isdir(os.path.join(skills_dir, d))]
+            if not skill_names:
+                await ctx.reply("스킬이 없습니다.")
+                return
+            listing = "\n".join(f"• `{s}`" for s in sorted(skill_names))
+            await ctx.reply(f"**스킬 목록:**\n{listing}")
+
+        elif action == "show":
+            if not name:
+                await ctx.reply("사용법: `!skill show <이름>`")
+                return
+            skill_file = os.path.join(skills_dir, name, "SKILL.md")
+            if not os.path.isfile(skill_file):
+                await ctx.reply(f"스킬 `{name}`을(를) 찾을 수 없습니다.")
+                return
+            with open(skill_file, "r", encoding="utf-8") as f:
+                content = f.read()
+            for chunk in split_message(content):
+                await ctx.reply(f"```markdown\n{chunk}\n```")
+
+        elif action == "create":
+            if not name:
+                await ctx.reply("사용법: `!skill create <이름>` + .md 파일 첨부")
+                return
+            if not ctx.message.attachments:
+                await ctx.reply(".md 파일을 첨부해주세요.")
+                return
+            att = ctx.message.attachments[0]
+            if not att.filename.endswith(".md"):
+                await ctx.reply(".md 파일만 가능합니다.")
+                return
+            content = (await att.read()).decode("utf-8")
+            skill_path = os.path.join(skills_dir, name)
+            os.makedirs(skill_path, exist_ok=True)
+            with open(os.path.join(skill_path, "SKILL.md"), "w", encoding="utf-8") as f:
+                f.write(content)
+            await ctx.reply(f"스킬 `{name}` 생성 완료: `{skill_path}`")
+
+        elif action == "delete":
+            if not name:
+                await ctx.reply("사용법: `!skill delete <이름>`")
+                return
+            skill_path = os.path.join(skills_dir, name)
+            if not os.path.isdir(skill_path):
+                await ctx.reply(f"스킬 `{name}`을(를) 찾을 수 없습니다.")
+                return
+            import shutil
+            shutil.rmtree(skill_path)
+            await ctx.reply(f"스킬 `{name}` 삭제 완료.")
+
+        else:
+            await ctx.reply("사용법: `!skill list|create|delete|show <이름>`")
+
 
 if __name__ == "__main__":
     # 단일 인스턴스 보장: 이미 실행 중이면 즉시 종료
@@ -655,14 +926,10 @@ if __name__ == "__main__":
         print("ALLOWED_USER_ID가 설정되지 않았습니다. .env 파일을 확인하세요.")
         exit(1)
 
-    import time
-
-    while True:
-        try:
-            bot = create_bot()
-            logger.info("봇 시작...")
-            bot.run(TOKEN, reconnect=True)
-        except Exception as e:
-            logger.error(f"봇이 예외로 종료됨: {e}", exc_info=True)
-        logger.warning("봇이 종료됨. 10초 후 재시작...")
-        time.sleep(10)
+    try:
+        bot = create_bot()
+        logger.info("봇 시작...")
+        bot.run(TOKEN, reconnect=True)
+    except Exception as e:
+        logger.error(f"봇이 예외로 종료됨: {e}", exc_info=True)
+    logger.warning("봇이 종료됨.")
