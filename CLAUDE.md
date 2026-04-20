@@ -27,11 +27,17 @@ Discord 메시지로 Claude Code CLI를 원격 실행하는 봇. 채널별 독�
 4. 작업 중 새 메시지 → ⏳ 리액션 후 대기 큐에 추가 → 현재 작업 완료 후 대기 메시지들을 합쳐서 한번에 전달
 5. 응답은 1900자 단위로 분할하여 코드블록으로 전송
 
-### Claude CLI 호출
+### Claude CLI 호출 (persistent 모드)
 - 경로: `~/.local/bin/claude.exe` (환경변수 `CLAUDE_PATH`로 변경 가능)
-- 플래그: `--dangerously-skip-permissions -p - --output-format stream-json --verbose`
+- 플래그: `--dangerously-skip-permissions -p --input-format stream-json --output-format stream-json --include-partial-messages --verbose`
+- **채널당 장기 실행 프로세스 1개** 유지 (매 메시지마다 spawn 안 함)
+- user 메시지는 stdin에 JSON 라인으로 전송: `{"type":"user","message":{"role":"user","content":"..."}}`
+- stdout은 백그라운드 `_stdout_reader` 태스크가 계속 읽어 `asyncio.Queue`로 전달
+- 턴 완료는 `result` 이벤트 수신으로 판정 (프로세스는 유지)
+- 프로세스는 **봇 종료 전까지 계속 살아있음** (idle timeout 없음)
+- work_dir 변경 시 프로세스 재생성 (cwd는 프로세스 시작 시 고정)
 - 이미지 있으면 `--add-dir`로 attachments 디렉토리 접근 허용
-- 타임아웃: 30분
+- 턴당 타임아웃: 30분
 - Windows에서 `CREATE_NO_WINDOW`로 GUI 창 방지
 - stdout 버퍼: `limit=1024*1024` (큰 JSON 라인 처리)
 - Unity 빌드용 환경변수 자동 전달: `ANDROID_HOME`, `JAVA_HOME`
@@ -43,8 +49,8 @@ Discord 메시지로 Claude Code CLI를 원격 실행하는 봇. 채널별 독�
 - 상태 메시지는 계속 수정(edit)되며, 작업 완료 시 자동 삭제
 
 ### 특수 명령 (Claude 카테고리 채널)
-- `중지` / `stop` / `멈춰` / `esc` — 실행 중인 프로세스 kill + 대기 큐 비움
-- `리셋` / `reset` / `새대화` — 세션 초기화
+- `중지` / `stop` / `멈춰` / `esc` — 프로세스 kill + 대기 큐 비움. 세션 ID는 유지(다음 메시지에 `--resume`)
+- `리셋` / `reset` / `새대화` — 프로세스 kill + 세션 ID 삭제 (완전 새 대화)
 
 ### ! 명령어 (모든 채널)
 - `!cc <프롬프트>` — Claude Code 실행

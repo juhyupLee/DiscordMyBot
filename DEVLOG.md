@@ -1,5 +1,18 @@
 # DEVLOG
 
+## 2026-04-20
+- **Persistent Claude 프로세스 모드 도입**: 채널당 Claude CLI 프로세스 1개 장기 실행 (매 메시지마다 spawn/kill 하던 방식 폐기)
+- `--input-format stream-json` + `--output-format stream-json` 사용, user 메시지는 stdin에 JSON 라인으로 전송
+- 백그라운드 `_stdout_reader` 태스크가 stdout을 파싱해 `asyncio.Queue`로 전달, 턴 단위로 이벤트 소비
+- 채널별 세션 객체 구조: `{proc, work_dir, reader_task, event_queue, last_active, session_id, lock}`
+- 프로세스 재생성 조건: work_dir 변경 / stdin write 실패 / `중지`·`리셋`·`!cd` / 프로세스 crash
+- 봇 재시작/프로세스 재생성 시 `--resume <session_id>`로 대화 맥락 자동 복원
+- **idle timeout 제거**: 프로세스는 봇 종료 전까지 계속 유지 (기존 30분 idle 종료 로직 제거 — resume 비용이 커서 역효과)
+- **spawn 중 피드백 추가**: 프로세스 시작/세션 복원 중 "🔧 Claude 세션 복원 중..." 사전 상태 메시지 즉시 전송
+- **중지 명령 개선**: 채널별 `asyncio.Task` 추적 → `중지` 시 `task.cancel()` + 프로세스 kill로 spawn 중에도 확실히 중단
+- `_process_channel`에 try/finally 추가, cancel 시에도 `channel_busy` 안전하게 정리
+- CLAUDE.md 아키텍처 설명 갱신
+
 ## 2026-04-16
 - **봇 자동 복구 시스템 구축**: `run_forever.vbs` 래퍼로 pythonw 종료 시 5초 내 즉시 재시작
 - Windows Task Scheduler(`DiscordBotWatchdog`)로 래퍼 자체 감시 (2분 간격 백업)
