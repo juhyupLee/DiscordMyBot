@@ -311,7 +311,18 @@ async def get_or_spawn_proc(channel_id: int, work_dir: str) -> dict:
 
 
 async def send_user_message(session: dict, content: str):
-    """Claude 프로세스에 user 메시지 JSON 라인 전송"""
+    """Claude 프로세스에 user 메시지 JSON 라인 전송. 전송 전 이전 턴 잔여 이벤트 드레인."""
+    queue: asyncio.Queue = session["event_queue"]
+    drained = 0
+    while not queue.empty():
+        try:
+            queue.get_nowait()
+            drained += 1
+        except asyncio.QueueEmpty:
+            break
+    if drained:
+        logger.warning(f"send_user_message: 이전 턴 잔여 이벤트 {drained}개 드레인")
+
     proc = session["proc"]
     msg = {"type": "user", "message": {"role": "user", "content": content}}
     line = json.dumps(msg, ensure_ascii=False) + "\n"
@@ -327,11 +338,20 @@ async def run_claude(prompt: str, work_dir: str, channel_id: int = 0,
                      reply_to: discord.Message | None = None) -> str:
     """claude CLI를 대화형 모드로 실행. 스트리밍으로 실시간 응답 표시. API 에러 시 자동 재시도."""
 
-    RETRY_PATTERNS = ["API Error", "Stream idle timeout", "overloaded", "529", "500", "오류 발생"]
+    # 결과 시작부/특정 문구만 매칭 (일반 답변에 "500", "529" 등이 섞여도 오탐 안 나도록)
+    def _is_error(res: str) -> bool:
+        if not res:
+            return True
+        if res.startswith("⏰") or res.startswith("오류 발생") or res.startswith("claude CLI를 찾을 수 없습니다"):
+            return True
+        for p in ("API Error", "Stream idle timeout", "Overloaded"):
+            if p in res:
+                return True
+        return False
 
     for attempt in range(MAX_RETRIES + 1):
         result = await _run_claude_once(prompt, work_dir, channel_id, image_paths, status_channel, reply_to)
-        if result and not any(p in result for p in RETRY_PATTERNS):
+        if not _is_error(result):
             return result
         if attempt < MAX_RETRIES:
             logger.warning(f"Claude API 오류, 재시도 {attempt + 1}/{MAX_RETRIES}: {result[:100]}")
@@ -736,11 +756,25 @@ async def _process_channel(ch_id: int, prompt: str, message: discord.Message, im
         while True:
             try:
                 work_dir = channel_workdirs.get(ch_id, WORKING_DIR)
-                async with message.channel.typing():
+                # typing() 진입 실패(Discord 503 등)해도 턴 자체는 계속 진행
+                typing_ctx = None
+                try:
+                    typing_ctx = message.channel.typing()
+                    await typing_ctx.__aenter__()
+                except Exception as e:
+                    logger.warning(f"typing() 진입 실패, 인디케이터 없이 계속: {e}")
+                    typing_ctx = None
+                try:
                     result = await run_claude(prompt, work_dir, channel_id=ch_id,
                                               image_paths=image_paths,
                                               status_channel=message.channel,
                                               reply_to=message)
+                finally:
+                    if typing_ctx:
+                        try:
+                            await typing_ctx.__aexit__(None, None, None)
+                        except Exception:
+                            pass
                 # 스트리밍으로 이미 전송됨. 에러/타임아웃 등 특수 경우만 별도 전송
                 if result.startswith("⏰") or result.startswith("오류") or result == "(빈 응답)":
                     await message.reply(f"```\n{result}\n```")

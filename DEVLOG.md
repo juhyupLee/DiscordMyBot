@@ -1,5 +1,11 @@
 # DEVLOG
 
+## 2026-04-25
+- **재시도 오탐 수정**: `RETRY_PATTERNS`의 `"500"`, `"529"` 부분 문자열 매칭으로 정상 응답("500개 모델" 등)을 API 에러로 오인해 재시도 → 중복 응답/`(빈 응답)` 발생하던 버그 수정
+- `_is_error()` 함수로 교체: 결과 시작부 체크 (`⏰`, `오류 발생`, `claude CLI를 찾을 수 없습니다`) + 특정 문구(`API Error`, `Stream idle timeout`, `Overloaded`)만 포함 매칭
+- **이전 턴 잔여 이벤트 드레인**: `send_user_message` 호출 전 `event_queue`를 비워, 턴이 비정상 종료돼 쌓인 이벤트가 다음 턴에 섞여 "과거 답변이 새 메시지에 오는" 현상 방지
+- **`typing()` 진입 실패 방어**: Discord 503 등으로 typing 인디케이터 진입 실패 시 전체 턴이 에러로 빠지던 문제 해결. `__aenter__` 실패해도 `run_claude` 계속 진행
+
 ## 2026-04-20
 - **Persistent Claude 프로세스 모드 도입**: 채널당 Claude CLI 프로세스 1개 장기 실행 (매 메시지마다 spawn/kill 하던 방식 폐기)
 - `--input-format stream-json` + `--output-format stream-json` 사용, user 메시지는 stdin에 JSON 라인으로 전송
