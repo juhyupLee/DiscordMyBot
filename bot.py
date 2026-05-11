@@ -224,6 +224,7 @@ async def spawn_persistent_proc(channel_id: int, work_dir: str) -> dict:
         "--include-partial-messages",
         "--verbose",
         "--add-dir", ATTACH_DIR,
+        "--add-dir", os.path.expanduser("~/.claude"),
     ]
 
     session_id = channel_sessions.get(channel_id)

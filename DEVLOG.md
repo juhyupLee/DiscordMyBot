@@ -1,5 +1,11 @@
 # DEVLOG
 
+## 2026-05-12
+- **글로벌 `~/.claude/` 디렉토리 접근 허용**: `spawn_persistent_proc`의 cmd에 `--add-dir os.path.expanduser("~/.claude")` 추가
+- 기존 문제: `--dangerously-skip-permissions` 플래그만으로는 작업 디렉토리(cwd) + 명시된 `--add-dir` 경로 밖은 Claude가 읽기/쓰기 거부 → 디스코드 봇에서 글로벌 스킬/슬래시 명령어 수정 시 "권한 없음" 응답
+- 이제 `~/.claude/skills/`, `~/.claude/commands/`, `~/.claude/settings.json` 모두 봇 세션에서 직접 수정 가능
+- Claude Code CLI 2.1.110 → 2.1.112 업데이트 (자동으로 `opus` alias가 `claude-opus-4-7`로 해석되도록)
+
 ## 2026-04-25
 - **재시도 오탐 수정**: `RETRY_PATTERNS`의 `"500"`, `"529"` 부분 문자열 매칭으로 정상 응답("500개 모델" 등)을 API 에러로 오인해 재시도 → 중복 응답/`(빈 응답)` 발생하던 버그 수정
 - `_is_error()` 함수로 교체: 결과 시작부 체크 (`⏰`, `오류 발생`, `claude CLI를 찾을 수 없습니다`) + 특정 문구(`API Error`, `Stream idle timeout`, `Overloaded`)만 포함 매칭
