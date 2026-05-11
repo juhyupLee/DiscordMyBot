@@ -5,6 +5,16 @@
 - 기존 문제: `--dangerously-skip-permissions` 플래그만으로는 작업 디렉토리(cwd) + 명시된 `--add-dir` 경로 밖은 Claude가 읽기/쓰기 거부 → 디스코드 봇에서 글로벌 스킬/슬래시 명령어 수정 시 "권한 없음" 응답
 - 이제 `~/.claude/skills/`, `~/.claude/commands/`, `~/.claude/settings.json` 모두 봇 세션에서 직접 수정 가능
 - Claude Code CLI 2.1.110 → 2.1.112 업데이트 (자동으로 `opus` alias가 `claude-opus-4-7`로 해석되도록)
+- **Discord 슬래시 커맨드 4개 추가** (`/skill`, `/cc`, `/cd`, `/pwd`): `bot.tree.sync()`로 등록, `on_ready`에서 자동 동기화
+- `/skill <name>` 자동완성: Claude Code의 `/` 메뉴와 유사한 UX. 글자 치면 매칭되는 스킬 후보가 description과 함께 25개 표시 (Discord autocomplete 한계)
+- 스킬 스캐너 `scan_all_skills()` 추가: 4개 출처 통합 검색
+  - 📁 프로젝트 `<work_dir>/.claude/skills/` + `<work_dir>/.claude/commands/`
+  - 🌐 글로벌 `~/.claude/skills/` + `~/.claude/commands/`
+  - 🔌 플러그인 `~/.claude/plugins/cache/*/*/<ver>/{skills,commands}/` (예: `codex:rescue`, `codex:review`)
+  - ⭐ 빌트인 슬래시 명령 하드코딩 리스트 (`init`, `review`, `security-review`, `simplify`, `loop`, `schedule`, `update-config`, `claude-api`, `keybindings-help`, `fewer-permission-prompts`)
+- `/cd <path>` 경로 자동완성: 입력 중인 디렉토리 하위 폴더를 동적으로 보여줌
+- 슬래시 커맨드 핸들러는 `_run_prompt_from_interaction`을 거쳐 기존 `_process_channel` 흐름에 끼워넣음 → busy 큐/세션 관리 자동 활용
+- **gstack-game 패키지 정리**: 안 쓰는 게임 개발 워크플로 스킬 28개 + `gstack-game` 메타를 `~/.claude/skills/`에서 삭제 (자동완성 노이즈 제거)
 
 ## 2026-04-25
 - **재시도 오탐 수정**: `RETRY_PATTERNS`의 `"500"`, `"529"` 부분 문자열 매칭으로 정상 응답("500개 모델" 등)을 API 에러로 오인해 재시도 → 중복 응답/`(빈 응답)` 발생하던 버그 수정

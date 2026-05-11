@@ -7,6 +7,7 @@ import logging
 import logging.handlers
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -722,6 +723,143 @@ async def _run_claude_once(prompt: str, work_dir: str, channel_id: int = 0,
         return f"오류 발생: {e}"
 
 
+def _read_skill_description(skill_md_path: str) -> str:
+    """SKILL.md frontmatter에서 description만 추출"""
+    try:
+        with open(skill_md_path, "r", encoding="utf-8") as f:
+            in_fm = False
+            for line in f:
+                stripped = line.rstrip()
+                if stripped == "---":
+                    if not in_fm:
+                        in_fm = True
+                        continue
+                    return ""
+                if in_fm and stripped.lower().startswith("description:"):
+                    return stripped.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _scan_skill_dir(skill_dir: str) -> list[dict]:
+    """단일 skills/ 디렉토리에서 (name, description) 추출"""
+    if not os.path.isdir(skill_dir):
+        return []
+    out = []
+    try:
+        for entry in os.listdir(skill_dir):
+            ep = os.path.join(skill_dir, entry)
+            skill_md = os.path.join(ep, "SKILL.md")
+            if not os.path.isfile(skill_md):
+                continue
+            out.append({"name": entry, "description": _read_skill_description(skill_md)})
+    except Exception as e:
+        logger.warning(f"스킬 디렉토리 스캔 실패 {skill_dir}: {e}")
+    return out
+
+
+def _scan_command_dir(cmd_dir: str) -> list[dict]:
+    """플러그인 commands/ 디렉토리의 .md 파일에서 (name, description) 추출"""
+    if not os.path.isdir(cmd_dir):
+        return []
+    out = []
+    try:
+        for entry in os.listdir(cmd_dir):
+            if not entry.endswith(".md"):
+                continue
+            path = os.path.join(cmd_dir, entry)
+            if not os.path.isfile(path):
+                continue
+            out.append({"name": entry[:-3], "description": _read_skill_description(path)})
+    except Exception as e:
+        logger.warning(f"플러그인 commands 디렉토리 스캔 실패 {cmd_dir}: {e}")
+    return out
+
+
+BUILTIN_SLASH_COMMANDS = [
+    ("init", "새 CLAUDE.md 생성 (코드베이스 문서화)"),
+    ("review", "PR 리뷰"),
+    ("security-review", "현재 브랜치 보안 리뷰"),
+    ("update-config", "settings.json 설정 변경 (권한, hooks, env)"),
+    ("simplify", "변경된 코드의 재사용/품질/효율 리뷰 + 수정"),
+    ("loop", "프롬프트/슬래시 명령을 주기적으로 실행"),
+    ("schedule", "원격 스케줄 에이전트 관리 (cron)"),
+    ("claude-api", "Claude API / Anthropic SDK 앱 빌드/디버그/최적화"),
+    ("keybindings-help", "키보드 단축키 커스터마이즈"),
+    ("fewer-permission-prompts", "권한 프롬프트 줄이는 allowlist 추가"),
+]
+
+
+def scan_all_skills(work_dir: str | None = None) -> list[dict]:
+    """프로젝트/글로벌/플러그인/빌트인 슬래시 명령을 모두 모아서 반환. {name, description, source}"""
+    skills: list[dict] = []
+    seen: set[str] = set()
+
+    if work_dir:
+        for s in _scan_skill_dir(os.path.join(work_dir, ".claude", "skills")):
+            if s["name"] not in seen:
+                seen.add(s["name"])
+                skills.append({**s, "source": "project"})
+        for c in _scan_command_dir(os.path.join(work_dir, ".claude", "commands")):
+            if c["name"] not in seen:
+                seen.add(c["name"])
+                skills.append({**c, "source": "project"})
+
+    for s in _scan_skill_dir(os.path.expanduser("~/.claude/skills")):
+        if s["name"] not in seen:
+            seen.add(s["name"])
+            skills.append({**s, "source": "global"})
+    for c in _scan_command_dir(os.path.expanduser("~/.claude/commands")):
+        if c["name"] not in seen:
+            seen.add(c["name"])
+            skills.append({**c, "source": "global"})
+
+    plugins_cache = os.path.expanduser("~/.claude/plugins/cache")
+    if os.path.isdir(plugins_cache):
+        try:
+            for marketplace in os.listdir(plugins_cache):
+                mp_path = os.path.join(plugins_cache, marketplace)
+                if not os.path.isdir(mp_path):
+                    continue
+                for plugin in os.listdir(mp_path):
+                    pl_path = os.path.join(mp_path, plugin)
+                    if not os.path.isdir(pl_path):
+                        continue
+                    for version in os.listdir(pl_path):
+                        version_dir = os.path.join(pl_path, version)
+                        for s in _scan_skill_dir(os.path.join(version_dir, "skills")):
+                            prefixed = f"{plugin}:{s['name']}"
+                            if prefixed in seen:
+                                continue
+                            seen.add(prefixed)
+                            skills.append({
+                                "name": prefixed,
+                                "description": s["description"],
+                                "source": f"plugin:{plugin}",
+                            })
+                        for c in _scan_command_dir(os.path.join(version_dir, "commands")):
+                            prefixed = f"{plugin}:{c['name']}"
+                            if prefixed in seen:
+                                continue
+                            seen.add(prefixed)
+                            skills.append({
+                                "name": prefixed,
+                                "description": c["description"],
+                                "source": f"plugin:{plugin}",
+                            })
+        except Exception as e:
+            logger.warning(f"플러그인 스킬 스캔 실패: {e}")
+
+    for name, desc in BUILTIN_SLASH_COMMANDS:
+        if name in seen:
+            continue
+        seen.add(name)
+        skills.append({"name": name, "description": desc, "source": "builtin"})
+
+    return skills
+
+
 def is_claude_channel(channel: discord.abc.GuildChannel) -> bool:
     """해당 채널이 Claude 카테고리에 속하는지 확인"""
     return (
@@ -875,6 +1013,12 @@ def _register_events(bot: commands.Bot):
         print(f"봇 로그인 완료: {bot.user}")
         print(f"허용된 유저 ID: {ALLOWED_USER_ID}")
         print(f"작업 디렉토리: {WORKING_DIR}")
+        # 슬래시 커맨드 동기화 (길드 단위면 즉시, 글로벌은 최대 1시간)
+        try:
+            synced = await bot.tree.sync()
+            logger.info(f"슬래시 커맨드 {len(synced)}개 동기화 완료: {[c.name for c in synced]}")
+        except Exception as e:
+            logger.error(f"슬래시 커맨드 sync 실패: {e}", exc_info=True)
         # 첨부파일 주기적 정리 시작
         asyncio.create_task(_attachment_cleanup_loop())
 
@@ -1051,6 +1195,112 @@ def _register_events(bot: commands.Bot):
 
         else:
             await ctx.reply("사용법: `!skill list|create|delete|show <이름>`")
+
+    # ---------- 슬래시 커맨드 ----------
+
+    async def _run_prompt_from_interaction(interaction: discord.Interaction, prompt: str):
+        """interaction에서 받은 프롬프트를 일반 메시지 처리 흐름에 끼워넣음"""
+        await interaction.response.defer(thinking=True)
+        sent_msg = await interaction.followup.send(f"▶ `{prompt[:80]}`")
+
+        ch_id = interaction.channel.id
+        if channel_busy.get(ch_id):
+            channel_pending.setdefault(ch_id, []).append((prompt, sent_msg, []))
+            return
+
+        channel_busy[ch_id] = True
+        task = asyncio.create_task(_process_channel(ch_id, prompt, sent_msg, []))
+        channel_tasks[ch_id] = task
+
+    @bot.tree.command(name="skill", description="스킬 실행 (자동완성 지원)")
+    @app_commands.describe(name="실행할 스킬", args="추가 인자 (선택)")
+    async def slash_skill(interaction: discord.Interaction, name: str, args: str = ""):
+        if interaction.user.id != ALLOWED_USER_ID:
+            await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+            return
+        prompt = f"/{name}" + (f" {args}" if args else "")
+        await _run_prompt_from_interaction(interaction, prompt)
+
+    @slash_skill.autocomplete("name")
+    async def _skill_ac(interaction: discord.Interaction, current: str):
+        work_dir = channel_workdirs.get(interaction.channel.id, WORKING_DIR)
+        skills = scan_all_skills(work_dir)
+        q = current.lower().strip()
+        if q:
+            skills = [s for s in skills if q in s["name"].lower()]
+        # source 별로 정렬: project → global → plugin → builtin
+        order = {"project": 0, "global": 1, "builtin": 3}
+        skills.sort(key=lambda s: (order.get(s["source"], 2), s["name"]))
+        choices = []
+        for s in skills[:25]:
+            src = s["source"]
+            if src == "project": tag = "📁"
+            elif src == "global": tag = "🌐"
+            elif src == "builtin": tag = "⭐"
+            else: tag = "🔌"
+            label = f"{tag} {s['name']}"
+            if s["description"]:
+                label = f"{label} — {s['description']}"
+            choices.append(app_commands.Choice(name=label[:100], value=s["name"][:100]))
+        return choices
+
+    @bot.tree.command(name="cc", description="Claude Code 프롬프트 실행")
+    @app_commands.describe(prompt="Claude에 전달할 프롬프트")
+    async def slash_cc(interaction: discord.Interaction, prompt: str):
+        if interaction.user.id != ALLOWED_USER_ID:
+            await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+            return
+        await _run_prompt_from_interaction(interaction, prompt)
+
+    @bot.tree.command(name="pwd", description="현재 채널 작업 디렉토리 확인")
+    async def slash_pwd(interaction: discord.Interaction):
+        if interaction.user.id != ALLOWED_USER_ID:
+            await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+            return
+        work_dir = channel_workdirs.get(interaction.channel.id, WORKING_DIR)
+        await interaction.response.send_message(f"`{work_dir}`", ephemeral=True)
+
+    @bot.tree.command(name="cd", description="채널 작업 디렉토리 변경")
+    @app_commands.describe(path="변경할 디렉토리 경로")
+    async def slash_cd(interaction: discord.Interaction, path: str):
+        if interaction.user.id != ALLOWED_USER_ID:
+            await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+            return
+        resolved = os.path.abspath(os.path.expanduser(path))
+        if not os.path.isdir(resolved):
+            await interaction.response.send_message(f"존재하지 않는 경로: `{resolved}`", ephemeral=True)
+            return
+        await kill_channel_proc(interaction.channel.id)
+        channel_workdirs[interaction.channel.id] = resolved
+        save_workdirs()
+        ensure_claude_settings(resolved)
+        await interaction.response.send_message(f"작업 디렉토리 변경: `{resolved}`")
+
+    @slash_cd.autocomplete("path")
+    async def _cd_ac(interaction: discord.Interaction, current: str):
+        try:
+            expanded = os.path.expanduser(current) if current else os.path.expanduser("~")
+            if os.path.isdir(expanded):
+                base, prefix = expanded, ""
+            else:
+                base = os.path.dirname(expanded) or "."
+                prefix = os.path.basename(expanded).lower()
+            if not os.path.isdir(base):
+                return []
+            entries = []
+            for e in os.listdir(base):
+                full = os.path.join(base, e)
+                if os.path.isdir(full) and e.lower().startswith(prefix):
+                    entries.append(full)
+            entries.sort()
+            choices = []
+            for e in entries[:25]:
+                # value는 100자 제한 — 뒤에서 자르기 (전체 경로 유지 우선)
+                value = e if len(e) <= 100 else e[-100:]
+                choices.append(app_commands.Choice(name=value, value=value))
+            return choices
+        except Exception:
+            return []
 
 
 if __name__ == "__main__":
