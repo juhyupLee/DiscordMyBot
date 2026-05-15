@@ -4,6 +4,8 @@ logs/
 attachments/
 channel_sessions.json
 channel_workdirs.json
+channel_models.json
+.bot_running
 WorkMD/
 .claude/
 venv*/

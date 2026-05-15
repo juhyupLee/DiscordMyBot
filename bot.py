@@ -30,7 +30,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
 WORKING_DIR = os.getenv("WORKING_DIR", os.getcwd())
 CLAUDE_CATEGORY_ID = int(os.getenv("CLAUDE_CATEGORY_ID", "0"))
-CLAUDE_PATH = os.getenv("CLAUDE_PATH", r"C:\Users\juhyu\.local\bin\claude.exe")
+CLAUDE_PATH = os.getenv("CLAUDE_PATH", os.path.expanduser(r"~\.local\bin\claude.exe"))
 
 # 채널별 장기 실행 Claude 프로세스 세션
 # {channel_id: {"proc", "work_dir", "reader_task", "event_queue", "last_active", "session_id", "lock"}}
@@ -48,6 +48,7 @@ channel_status: dict[int, str] = {}
 # 채널별 작업 디렉토리 & 세션 (파일에 저장하여 재시작해도 유지)
 WORKDIRS_FILE = os.path.join(os.path.dirname(__file__), "channel_workdirs.json")
 SESSIONS_FILE = os.path.join(os.path.dirname(__file__), "channel_sessions.json")
+MODELS_FILE = os.path.join(os.path.dirname(__file__), "channel_models.json")
 
 def load_json_dict(path: str) -> dict[int, str]:
     try:
@@ -66,8 +67,14 @@ def save_workdirs():
 def save_sessions():
     save_json_dict(SESSIONS_FILE, channel_sessions)
 
+def save_models():
+    save_json_dict(MODELS_FILE, channel_models)
+
 channel_workdirs: dict[int, str] = load_json_dict(WORKDIRS_FILE)
 channel_sessions: dict[int, str] = load_json_dict(SESSIONS_FILE)
+channel_models: dict[int, str] = load_json_dict(MODELS_FILE)
+
+MODEL_ALIASES = ["opus", "sonnet", "haiku"]
 
 DEFAULT_PERMISSIONS = ["Bash(*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)"]
 
@@ -188,6 +195,31 @@ TOOL_ICONS = {
 }
 
 
+async def _stderr_reader(channel_id: int, proc: asyncio.subprocess.Process, buffer: list):
+    """프로세스 stderr를 읽어 로그에 남기고 buffer에 누적 (returncode!=0 진단용)"""
+    try:
+        while True:
+            line = await proc.stderr.readline()
+            if not line:
+                return
+            text = line.decode("utf-8", errors="replace").rstrip()
+            if not text:
+                continue
+            logger.warning(f"채널 {channel_id} stderr: {text}")
+            buffer.append(text)
+            if len(buffer) > 200:
+                del buffer[:len(buffer) - 200]
+            # resume 실패 자동 복구: 만료된 session_id 제거
+            if "No conversation found" in text and channel_id in channel_sessions:
+                stale = channel_sessions.pop(channel_id, None)
+                save_sessions()
+                logger.warning(f"채널 {channel_id}: 만료 session_id 폐기 ({stale}), 다음 spawn은 fresh start")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning(f"채널 {channel_id} stderr reader 종료: {e}")
+
+
 async def _stdout_reader(channel_id: int, proc: asyncio.subprocess.Process, queue: asyncio.Queue):
     """프로세스 stdout을 지속적으로 읽어 JSON 이벤트로 파싱 후 queue에 전달. EOF 시 sentinel 전송."""
     try:
@@ -232,11 +264,18 @@ async def spawn_persistent_proc(channel_id: int, work_dir: str) -> dict:
     if session_id:
         cmd += ["--resume", session_id]
 
-    logger.info(f"Claude persistent 프로세스 시작: cwd={work_dir}, channel={channel_id}, resume={session_id}")
+    model = channel_models.get(channel_id)
+    if model:
+        cmd += ["--model", model]
+
+    logger.info(f"Claude persistent 프로세스 시작: cwd={work_dir}, channel={channel_id}, resume={session_id}, model={model or '(default)'}")
 
     env = os.environ.copy()
-    env["ANDROID_HOME"] = r"C:\Program Files\Unity\Hub\Editor\6000.3.10f1\Editor\Data\PlaybackEngines\AndroidPlayer\SDK"
-    env["JAVA_HOME"] = r"C:\Program Files\Unity\Hub\Editor\6000.3.10f1\Editor\Data\PlaybackEngines\AndroidPlayer\OpenJDK"
+    # Unity 빌드용 환경변수 — .env에 설정된 경우만 전달
+    for key in ("ANDROID_HOME", "JAVA_HOME"):
+        val = os.getenv(key)
+        if val:
+            env[key] = val
 
     kwargs = dict(
         stdin=subprocess.PIPE,
@@ -251,12 +290,16 @@ async def spawn_persistent_proc(channel_id: int, work_dir: str) -> dict:
     proc = await asyncio.create_subprocess_exec(*cmd, limit=1024*1024, **kwargs)
     event_queue: asyncio.Queue = asyncio.Queue()
     reader_task = asyncio.create_task(_stdout_reader(channel_id, proc, event_queue))
+    stderr_buffer: list[str] = []
+    stderr_task = asyncio.create_task(_stderr_reader(channel_id, proc, stderr_buffer))
 
     import time as _time
     session = {
         "proc": proc,
         "work_dir": work_dir,
         "reader_task": reader_task,
+        "stderr_task": stderr_task,
+        "stderr_buffer": stderr_buffer,
         "event_queue": event_queue,
         "last_active": _time.time(),
         "session_id": session_id,
@@ -273,6 +316,8 @@ async def kill_channel_proc(channel_id: int):
         return
     proc = session["proc"]
     reader_task = session["reader_task"]
+    stderr_task = session.get("stderr_task")
+    stderr_buffer = session.get("stderr_buffer") or []
     try:
         proc.kill()
     except Exception:
@@ -281,6 +326,11 @@ async def kill_channel_proc(channel_id: int):
         reader_task.cancel()
     except Exception:
         pass
+    if stderr_task:
+        try:
+            stderr_task.cancel()
+        except Exception:
+            pass
     try:
         if proc.stderr:
             proc.stderr.close()
@@ -290,7 +340,12 @@ async def kill_channel_proc(channel_id: int):
         await proc.wait()
     except Exception:
         pass
-    logger.info(f"채널 {channel_id}: 프로세스 종료")
+    rc = proc.returncode
+    if rc not in (None, 0) and stderr_buffer:
+        tail = "\n".join(stderr_buffer[-10:])
+        logger.error(f"채널 {channel_id}: 프로세스 종료 (returncode={rc}) stderr tail:\n{tail}")
+    else:
+        logger.info(f"채널 {channel_id}: 프로세스 종료 (returncode={rc})")
 
 
 async def get_or_spawn_proc(channel_id: int, work_dir: str) -> dict:
@@ -595,13 +650,37 @@ async def _run_claude_once(prompt: str, work_dir: str, channel_id: int = 0,
                 if msg_type == "assistant" and status_channel:
                     for content in data.get("message", {}).get("content", []):
                         if content.get("type") == "tool_use" and content.get("name") == "AskUserQuestion":
-                            question = content.get("input", {}).get("question", "(질문 내용 없음)")
+                            tool_input = content.get("input", {})
+                            # 신형 schema: input.questions[] / 구형: input.question
+                            questions = tool_input.get("questions") or (
+                                [{"question": tool_input["question"]}] if tool_input.get("question") else []
+                            )
+                            lines = []
+                            for q in questions:
+                                q_text = q.get("question", "").strip()
+                                header = q.get("header", "").strip()
+                                if header:
+                                    lines.append(f"**[{header}]** {q_text}")
+                                elif q_text:
+                                    lines.append(f"**{q_text}**")
+                                for i, opt in enumerate(q.get("options", []), 1):
+                                    label = opt.get("label", "")
+                                    desc = opt.get("description", "")
+                                    line = f"  `{i}.` {label}"
+                                    if desc:
+                                        line += f" — {desc}"
+                                    lines.append(line)
+                            body = "\n".join(lines) if lines else "(질문 내용 없음)"
                             await _flush_stream()
                             try:
                                 if status_msg:
                                     await status_msg.delete()
                                     status_msg = None
-                                await status_channel.send(f"❓ **Claude가 질문합니다:**\n{question}\n*(답변을 입력하면 다음 메시지로 전달됩니다)*")
+                                msg_text = f"❓ **Claude가 질문합니다:**\n{body}\n*(답변을 입력하면 다음 메시지로 전달됩니다)*"
+                                # Discord 2000자 제한 대응
+                                if len(msg_text) > 1900:
+                                    msg_text = msg_text[:1900] + "\n... (잘림)"
+                                await status_channel.send(msg_text)
                             except Exception:
                                 pass
                             continue
@@ -1122,11 +1201,34 @@ def _register_events(bot: commands.Bot):
 
     @bot.command(name="pwd")
     async def print_dir(ctx: commands.Context):
-        """!pwd - 현재 채널의 작업 디렉토리 확인"""
+        """!pwd - 현재 채널의 작업 디렉토리 + 모델 확인"""
         if ctx.author.id != ALLOWED_USER_ID:
             return
         work_dir = channel_workdirs.get(ctx.channel.id, WORKING_DIR)
-        await ctx.reply(f"`{work_dir}`")
+        model = channel_models.get(ctx.channel.id, "(default)")
+        await ctx.reply(f"📁 `{work_dir}`\n🤖 model: `{model}`")
+
+    @bot.command(name="model")
+    async def change_model(ctx: commands.Context, *, name: str = ""):
+        """!model <opus|sonnet|haiku|클리어> - 채널 모델 변경. 인자 없으면 현재 모델 확인."""
+        if ctx.author.id != ALLOWED_USER_ID:
+            return
+        ch_id = ctx.channel.id
+        name = name.strip()
+        if not name:
+            current = channel_models.get(ch_id, "(default)")
+            await ctx.reply(f"현재 모델: `{current}` (사용 가능: opus / sonnet / haiku / clear)")
+            return
+        if name.lower() in ("clear", "default", "기본", "해제"):
+            channel_models.pop(ch_id, None)
+            save_models()
+            await kill_channel_proc(ch_id)
+            await ctx.reply("모델 설정 해제. 기본값(default) 사용.")
+            return
+        channel_models[ch_id] = name
+        save_models()
+        await kill_channel_proc(ch_id)
+        await ctx.reply(f"모델 변경: `{name}` (다음 메시지부터 적용)")
 
     @bot.command(name="skill")
     async def manage_skill(ctx: commands.Context, action: str = "list", *, name: str = ""):
@@ -1252,13 +1354,39 @@ def _register_events(bot: commands.Bot):
             return
         await _run_prompt_from_interaction(interaction, prompt)
 
-    @bot.tree.command(name="pwd", description="현재 채널 작업 디렉토리 확인")
+    @bot.tree.command(name="pwd", description="현재 채널 작업 디렉토리 + 모델 확인")
     async def slash_pwd(interaction: discord.Interaction):
         if interaction.user.id != ALLOWED_USER_ID:
             await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
             return
         work_dir = channel_workdirs.get(interaction.channel.id, WORKING_DIR)
-        await interaction.response.send_message(f"`{work_dir}`", ephemeral=True)
+        model = channel_models.get(interaction.channel.id, "(default)")
+        await interaction.response.send_message(f"📁 `{work_dir}`\n🤖 model: `{model}`", ephemeral=True)
+
+    @bot.tree.command(name="model", description="채널 Claude 모델 변경 (opus/sonnet/haiku)")
+    @app_commands.describe(name="모델 이름 (opus, sonnet, haiku, clear)")
+    async def slash_model(interaction: discord.Interaction, name: str):
+        if interaction.user.id != ALLOWED_USER_ID:
+            await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+            return
+        ch_id = interaction.channel.id
+        if name.lower() in ("clear", "default", "기본", "해제"):
+            channel_models.pop(ch_id, None)
+            save_models()
+            await kill_channel_proc(ch_id)
+            await interaction.response.send_message("모델 설정 해제. 기본값(default) 사용.")
+            return
+        channel_models[ch_id] = name
+        save_models()
+        await kill_channel_proc(ch_id)
+        await interaction.response.send_message(f"🤖 모델 변경: `{name}` (다음 메시지부터 적용)")
+
+    @slash_model.autocomplete("name")
+    async def _model_ac(interaction: discord.Interaction, current: str):
+        choices_src = MODEL_ALIASES + ["clear"]
+        cur = current.lower().strip()
+        matched = [m for m in choices_src if cur in m.lower()] if cur else choices_src
+        return [app_commands.Choice(name=m, value=m) for m in matched[:25]]
 
     @bot.tree.command(name="cd", description="채널 작업 디렉토리 변경")
     @app_commands.describe(path="변경할 디렉토리 경로")
