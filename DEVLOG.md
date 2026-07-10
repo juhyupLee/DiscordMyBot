@@ -1,5 +1,18 @@
 # DEVLOG
 
+## 2026-07-10
+- **Codex 백엔드 통합**: 채널별로 Claude/Codex를 선택할 수 있으며, Codex `exec --json` 세션 재개와 채널별 모델·추론 강도 설정을 지원
+- `/select-model`, `/reasoning`, `/backend` 및 대응 prefix 명령 추가. Codex 모델 캐시를 읽어 현재 계정에서 사용할 수 있는 모델과 지원 추론 강도를 자동완성
+- **Codex 진행 패널 개선**: 명령 실행, 파일 수정, 도구 사용, 자료 검색, 계획 갱신과 공개 중간 안내를 최근 7개까지 누적 표시
+- 1초 안에 연속으로 들어온 이벤트도 메모리에 보존하고 Discord 수정 요청만 속도 제한. 15초 생존 갱신과 오래된 작업 자동 압축 추가
+- 완료 시 진행 패널을 제거하고 중간 commentary를 제외한 마지막 결론만 최종 답변으로 전송
+- **전역 Codex 플러그인 연동**: `~/.codex/config.toml`의 Chrome 등 설치된 플러그인을 모든 채널에서 로드하고, 연결되지 않은 localhost MCP만 해당 실행에서 자동 비활성화
+- **예약 작업 기능**: `daily`/`every`/`once` 방식의 예약 추가·조회·삭제, 재시작 후 일정 복원과 실행 중 상태 보존 구현
+- **결과물 전달 개선**: 스크린샷 요청 감지·자동 첨부, 직전 작업 파일 다운로드, 이미지 경로 정규화와 Discord 첨부 제한 처리 추가
+- 프로젝트/글로벌/플러그인 Codex 스킬 검색과 자동완성, 스킬 호출 프롬프트 변환, 채널별 작업 디렉토리·세션 흐름 연동
+- `run_forever.vbs` 로그 기록을 `WriteLog`로 통합해 파일 접근 실패가 감시 루프를 중단시키지 않도록 보강
+- 공개 저장소 보호를 위해 개인 지침·로컬 스킬·예약 데이터(`AGENTS.md`, `.agents/`, `scheduled_jobs.json`)를 Git 추적에서 제외
+
 ## 2026-05-12
 - **글로벌 `~/.claude/` 디렉토리 접근 허용**: `spawn_persistent_proc`의 cmd에 `--add-dir os.path.expanduser("~/.claude")` 추가
 - 기존 문제: `--dangerously-skip-permissions` 플래그만으로는 작업 디렉토리(cwd) + 명시된 `--add-dir` 경로 밖은 Claude가 읽기/쓰기 거부 → 디스코드 봇에서 글로벌 스킬/슬래시 명령어 수정 시 "권한 없음" 응답

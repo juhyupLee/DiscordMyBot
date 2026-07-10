@@ -15,6 +15,18 @@ If Not fso.FolderExists(logDir) Then fso.CreateFolder(logDir)
 Dim logPath
 logPath = logDir & "\watchdog.log"
 
+Sub WriteLog(message)
+    On Error Resume Next
+    Dim lf
+    Set lf = fso.OpenTextFile(logPath, 8, True)
+    If Err.Number = 0 Then
+        lf.WriteLine Now & " - " & message
+        lf.Close
+    End If
+    Err.Clear
+    On Error GoTo 0
+End Sub
+
 ' pythonw 경로 — 환경변수 PYTHONW_PATH가 있으면 그걸 쓰고, 없으면 PATH의 pythonw 사용
 Dim pyExe
 pyExe = WshShell.ExpandEnvironmentStrings("%PYTHONW_PATH%")
@@ -22,21 +34,15 @@ If pyExe = "%PYTHONW_PATH%" Or pyExe = "" Then
     pyExe = "pythonw"
 End If
 
-Set f = fso.OpenTextFile(logPath, 8, True)
-f.WriteLine Now & " - run_forever started (cwd=" & botDir & ", py=" & pyExe & ")"
-f.Close
+WriteLog "run_forever started (cwd=" & botDir & ", py=" & pyExe & ")"
 
 Do While True
-    Set f = fso.OpenTextFile(logPath, 8, True)
-    f.WriteLine Now & " - launching " & pyExe & " bot.py"
-    f.Close
+    WriteLog "launching " & pyExe & " bot.py"
 
     Dim exitCode
     exitCode = WshShell.Run("""" & pyExe & """ bot.py", 0, True)
 
-    Set f = fso.OpenTextFile(logPath, 8, True)
-    f.WriteLine Now & " - pythonw exited (code: " & exitCode & "), restarting in 5s"
-    f.Close
+    WriteLog "pythonw exited (code: " & exitCode & "), restarting in 5s"
 
     WScript.Sleep 5000
 Loop

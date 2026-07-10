@@ -5,8 +5,15 @@ attachments/
 channel_sessions.json
 channel_workdirs.json
 channel_models.json
+channel_backends.json
+channel_codex_sessions.json
+channel_codex_models.json
+channel_reasoning.json
+scheduled_jobs.json
 .bot_running
 WorkMD/
 .claude/
+.agents/
+AGENTS.md
 venv*/
 *.png
