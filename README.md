@@ -12,6 +12,9 @@ Discord 메시지로 [OpenAI Codex CLI](https://developers.openai.com/codex/cli/
 - **Codex / Claude 선택**: 채널별로 백엔드를 고르고 다음 메시지부터 즉시 전환
 - **실시간 진행 표시**: JSON 이벤트를 파싱해 도구 호출, 명령 실행, 파일 수정과 공개 중간 안내를 Discord에 누적 표시
 - **세션 지속**: Codex는 thread ID로 턴마다 재개하고, Claude는 채널당 장기 실행 프로세스로 문맥 유지
+- **작업 시간 제한 없음**: 장시간 도구 실행도 자동 종료하지 않고 완료될 때까지 대기하며, 필요하면 `중지` 명령으로 직접 취소
+- **대용량 스트림 안전 처리**: Codex/Claude가 StreamReader 제한보다 큰 JSONL 한 줄을 출력해도 최대 64MB까지 청크로 복원하고 다음 이벤트를 계속 처리
+- **Codex 사용량 자동 재개**: 사용량 제한 시 작업·세션·첨부를 보관하고 공식 `resetsAt` 이후 자동 재개. 반복 실패하면 Claude가 읽기 전용 감독 점검
 - **슬래시 커맨드 + 자동완성**:
   - `/skill <name>` — 프로젝트 / 글로벌 / 플러그인 / 빌트인 슬래시 명령 통합 검색
   - `/cc <prompt>` — Claude Code 직접 실행
@@ -114,7 +117,7 @@ CLAUDE_CATEGORY_ID=Claude를_쓸_카테고리_ID
 ### 특수 명령 (설정된 카테고리 내, 일반 메시지)
 | 키워드 | 동작 |
 |--------|------|
-| `중지` / `stop` / `멈춰` / `esc` | 현재 작업 즉시 중단 (세션 ID는 유지) |
+| `중지` / `중지해줘` / `stop` / `멈춰` / `멈춰줘` / `취소` / `esc` | 현재 작업·하위 프로세스·진행 패널·자동 재개를 즉시 중단 (세션 ID는 유지) |
 | `리셋` / `reset` / `새대화` | 세션 ID 폐기 + 완전 새 대화 시작 |
 
 ---
@@ -139,6 +142,7 @@ CLAUDE_CATEGORY_ID=Claude를_쓸_카테고리_ID
 ├── channel_codex_sessions.json # 채널별 Codex thread ID (런타임 생성, gitignore됨)
 ├── channel_codex_models.json # 채널별 Codex 모델 (런타임 생성, gitignore됨)
 ├── channel_reasoning.json    # 채널별 Codex 추론 강도 (런타임 생성, gitignore됨)
+├── codex_deferred_jobs.json  # 사용량 제한으로 보관된 자동 재개 작업 (런타임 생성, gitignore됨)
 ├── scheduled_jobs.json       # 예약 작업 데이터 (런타임 생성, gitignore됨)
 ├── attachments/              # Discord 첨부파일 (24h 자동 정리, gitignore됨)
 └── logs/                     # RotatingFileHandler (5MB × 3, gitignore됨)

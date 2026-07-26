@@ -8,6 +8,7 @@ import logging.handlers
 import shlex
 import re
 import time
+import glob
 from datetime import datetime, timedelta
 import aiohttp
 import discord
@@ -46,6 +47,9 @@ channel_claude_procs: dict[int, dict] = {}
 channel_busy: dict[int, bool] = {}
 # 채널별 실행 중인 _process_channel 태스크 (중지 시 cancel 용)
 channel_tasks: dict[int, asyncio.Task] = {}
+# 채널별 실행 중인 Codex 단발 프로세스와 상태 메시지 리소스
+# {channel_id: {"proc", "status_task", "status_msg"}}
+channel_codex_runs: dict[int, dict] = {}
 
 # 채널별 대기 중인 메시지 큐 (모아서 한 번에 전달)
 channel_pending: dict[int, list[tuple]] = {}  # {channel_id: [(prompt, message, image_paths), ...]}
@@ -62,12 +66,94 @@ BACKENDS_FILE = os.path.join(os.path.dirname(__file__), "channel_backends.json")
 CODEX_SESSIONS_FILE = os.path.join(os.path.dirname(__file__), "channel_codex_sessions.json")
 CODEX_MODELS_FILE = os.path.join(os.path.dirname(__file__), "channel_codex_models.json")
 CODEX_REASONING_FILE = os.path.join(os.path.dirname(__file__), "channel_reasoning.json")
+CODEX_DEFERRED_FILE = os.path.join(os.path.dirname(__file__), "codex_deferred_jobs.json")
 CODEX_MODELS_CACHE_FILE = os.getenv(
     "CODEX_MODELS_CACHE_FILE",
     os.path.join(os.path.expanduser("~"), ".codex", "models_cache.json"),
 )
 SCHEDULES_FILE = os.path.join(os.path.dirname(__file__), "scheduled_jobs.json")
 SCHEDULE_RUNTIME_FIELDS = {"running", "started_at"}
+CODEX_DEFERRED_RUNTIME_FIELDS = {"running", "started_at"}
+CODEX_LIMIT_RETRY_GRACE_SECONDS = 60
+CODEX_DEFERRED_BUSY_RETRY_MINUTES = 5
+CODEX_DEFERRED_FALLBACK_RETRY_MINUTES = 60
+CODEX_CLAUDE_AUDIT_FAILURE_THRESHOLD = 3
+CODEX_CLAUDE_AUDIT_INTERVAL_MINUTES = 60
+JSONL_MAX_LINE_BYTES = 64 * 1024 * 1024
+
+
+class JsonlLineTooLargeError(ValueError):
+    pass
+
+
+async def _discard_jsonl_line(reader: asyncio.StreamReader):
+    """현재 JSONL 줄의 나머지를 버리고 다음 줄 경계로 복구한다."""
+    while True:
+        try:
+            await reader.readuntil(b"\n")
+            return
+        except asyncio.LimitOverrunError as error:
+            consume = max(1, int(error.consumed))
+            try:
+                await reader.readexactly(consume)
+            except asyncio.IncompleteReadError:
+                return
+        except asyncio.IncompleteReadError:
+            return
+
+
+async def _read_jsonl_line(
+    reader: asyncio.StreamReader,
+    *,
+    max_bytes: int = JSONL_MAX_LINE_BYTES,
+) -> bytes:
+    """StreamReader 제한보다 긴 JSONL 한 줄도 청크로 회수해 온전하게 반환한다."""
+    chunks: list[bytes] = []
+    total = 0
+
+    while True:
+        try:
+            chunk = await reader.readuntil(b"\n")
+        except asyncio.LimitOverrunError as error:
+            consume = max(1, int(error.consumed))
+            if total + consume > max_bytes:
+                await _discard_jsonl_line(reader)
+                raise JsonlLineTooLargeError(
+                    f"JSONL line exceeds safety limit ({max_bytes} bytes)"
+                )
+            try:
+                chunk = await reader.readexactly(consume)
+            except asyncio.IncompleteReadError as incomplete:
+                chunk = incomplete.partial
+                total += len(chunk)
+                if total > max_bytes:
+                    raise JsonlLineTooLargeError(
+                        f"JSONL line exceeds safety limit ({max_bytes} bytes)"
+                    )
+                chunks.append(chunk)
+                return b"".join(chunks)
+            chunks.append(chunk)
+            total += len(chunk)
+            continue
+        except asyncio.IncompleteReadError as incomplete:
+            chunk = incomplete.partial
+            if not chunk and not chunks:
+                return b""
+            total += len(chunk)
+            if total > max_bytes:
+                raise JsonlLineTooLargeError(
+                    f"JSONL line exceeds safety limit ({max_bytes} bytes)"
+                )
+            chunks.append(chunk)
+            return b"".join(chunks)
+
+        total += len(chunk)
+        if total > max_bytes:
+            raise JsonlLineTooLargeError(
+                f"JSONL line exceeds safety limit ({max_bytes} bytes)"
+            )
+        chunks.append(chunk)
+        return b"".join(chunks)
 
 def load_json_dict(path: str) -> dict[int, str]:
     try:
@@ -120,6 +206,38 @@ def save_schedules(*, deleted_ids: set[str] | None = None):
     scheduled_jobs.clear()
     scheduled_jobs.update(merged)
 
+def load_codex_deferred_jobs() -> dict[int, dict]:
+    try:
+        with open(CODEX_DEFERRED_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        jobs: dict[int, dict] = {}
+        for channel_id, job in data.items():
+            if not isinstance(job, dict):
+                continue
+            clean = {k: v for k, v in job.items() if k not in CODEX_DEFERRED_RUNTIME_FIELDS}
+            jobs[int(channel_id)] = clean
+        return jobs
+    except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError) as e:
+        if not isinstance(e, FileNotFoundError):
+            logger.warning(f"Codex 자동 재개 대기열 로드 실패: {e}")
+        return {}
+
+def save_codex_deferred_jobs():
+    payload = {
+        str(channel_id): {
+            k: v for k, v in job.items()
+            if k not in CODEX_DEFERRED_RUNTIME_FIELDS
+        }
+        for channel_id, job in codex_deferred_jobs.items()
+        if isinstance(job, dict)
+    }
+    tmp_path = f"{CODEX_DEFERRED_FILE}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, CODEX_DEFERRED_FILE)
+
 def save_workdirs():
     save_json_dict(WORKDIRS_FILE, channel_workdirs)
 
@@ -150,6 +268,10 @@ channel_codex_models: dict[int, str] = load_json_dict(CODEX_MODELS_FILE)  # 채�
 channel_reasoning: dict[int, str] = load_json_dict(CODEX_REASONING_FILE)  # 채널별 Codex reasoning effort
 scheduled_jobs: dict[str, dict] = load_schedules()
 for _job in scheduled_jobs.values():
+    _job.pop("running", None)
+    _job.pop("started_at", None)
+codex_deferred_jobs: dict[int, dict] = load_codex_deferred_jobs()
+for _job in codex_deferred_jobs.values():
     _job.pop("running", None)
     _job.pop("started_at", None)
 scheduler_task: asyncio.Task | None = None
@@ -710,6 +832,251 @@ async def apply_selected_model(channel_id: int, name: str) -> tuple[bool, str]:
 
 CODEX_PATH = _resolve_codex_path()
 
+
+class CodexUsageLimitError(RuntimeError):
+    def __init__(self, message: str, *, retry_at: datetime, thread_id: str | None = None):
+        super().__init__(message)
+        self.retry_at = retry_at
+        self.thread_id = thread_id
+
+
+def _resolve_codex_app_server_path() -> str | None:
+    override = os.getenv("CODEX_APP_SERVER_PATH", "").strip()
+    if override and os.path.isfile(override):
+        return override
+
+    if CODEX_PATH.lower().endswith(".exe") and os.path.isfile(CODEX_PATH):
+        return CODEX_PATH
+
+    launcher = os.path.abspath(CODEX_PATH) if os.path.dirname(CODEX_PATH) else ""
+    base_dir = os.path.dirname(launcher) if launcher else os.path.expanduser(r"~\AppData\Roaming\npm")
+    patterns = [
+        os.path.join(
+            base_dir, "node_modules", "@openai", "codex", "node_modules", "@openai",
+            "codex-win32-*", "vendor", "*", "bin", "codex.exe",
+        ),
+        os.path.join(
+            base_dir, "node_modules", "@openai", "codex", "vendor", "*", "bin", "codex.exe",
+        ),
+    ]
+    for pattern in patterns:
+        matches = sorted(glob.glob(pattern), reverse=True)
+        if matches:
+            return matches[0]
+    return None
+
+
+def _is_codex_usage_limit_error(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(marker in lowered for marker in (
+        "you've hit your usage limit",
+        "you have hit your usage limit",
+        "usage limit reached",
+        "usage_limit_reached",
+        "rate_limit_reached",
+    ))
+
+
+def _is_codex_missing_thread_error(text: str) -> bool:
+    """실제로 재개할 Codex 스레드가 없을 때만 저장된 세션을 폐기한다."""
+    lowered = str(text or "").lower()
+    return any(marker in lowered for marker in (
+        "no conversation found",
+        "thread not found",
+        "thread was not found",
+        "no rollout found for thread",
+        "could not find thread",
+        "unknown thread id",
+    ))
+
+
+def _parse_codex_usage_reset_at(text: str, *, now: datetime | None = None) -> datetime | None:
+    now = now or datetime.now()
+    source = str(text or "")
+
+    relative = re.search(
+        r"try again in\s+(\d+)\s*(second|minute|hour)s?",
+        source,
+        flags=re.IGNORECASE,
+    )
+    if relative:
+        amount = int(relative.group(1))
+        unit = relative.group(2).lower()
+        if unit == "second":
+            return now + timedelta(seconds=amount)
+        if unit == "minute":
+            return now + timedelta(minutes=amount)
+        return now + timedelta(hours=amount)
+
+    match = re.search(
+        r"try again at\s+([^\r\n]+?)(?:\.\s*$|$)",
+        source,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    if not match:
+        return None
+
+    value = re.sub(r"(\d{1,2})(st|nd|rd|th)", r"\1", match.group(1), flags=re.IGNORECASE)
+    value = value.strip().rstrip(".")
+    for fmt in (
+        "%b %d, %Y %I:%M %p",
+        "%B %d, %Y %I:%M %p",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    ):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _codex_rate_limit_state_from_result(result: dict, *, now: datetime | None = None) -> dict:
+    now = now or datetime.now()
+    buckets = result.get("rateLimitsByLimitId") if isinstance(result, dict) else None
+    if not isinstance(buckets, dict) or not buckets:
+        single = result.get("rateLimits") if isinstance(result, dict) else None
+        buckets = {"codex": single} if isinstance(single, dict) else {}
+
+    blocked: list[dict] = []
+    for limit_id, bucket in buckets.items():
+        if not isinstance(bucket, dict):
+            continue
+        reached_type = bucket.get("rateLimitReachedType")
+        windows = []
+        for window_name in ("primary", "secondary"):
+            window = bucket.get(window_name)
+            if not isinstance(window, dict):
+                continue
+            used = window.get("usedPercent")
+            reset_ts = window.get("resetsAt")
+            windows.append({"name": window_name, "used": used, "reset_ts": reset_ts})
+
+        selected = []
+        if reached_type in ("primary", "secondary"):
+            selected = [window for window in windows if window["name"] == reached_type]
+        if not selected:
+            selected = [
+                window for window in windows
+                if isinstance(window.get("used"), (int, float)) and window["used"] >= 100
+            ]
+        if reached_type and not selected:
+            selected = windows
+        if not reached_type and not selected:
+            continue
+
+        reset_times = [
+            datetime.fromtimestamp(float(window["reset_ts"]))
+            for window in selected
+            if isinstance(window.get("reset_ts"), (int, float))
+        ]
+        retry_at = max(reset_times) if reset_times else now + timedelta(minutes=CODEX_DEFERRED_FALLBACK_RETRY_MINUTES)
+        retry_at += timedelta(seconds=CODEX_LIMIT_RETRY_GRACE_SECONDS)
+        blocked.append({
+            "limit_id": str(limit_id),
+            "reached_type": reached_type,
+            "retry_at": retry_at,
+            "used_percent": max(
+                [float(window["used"]) for window in selected if isinstance(window.get("used"), (int, float))]
+                or [100.0]
+            ),
+        })
+
+    if not blocked:
+        return {"blocked": False, "retry_at": None, "limit_id": None, "reached_type": None}
+    latest = max(blocked, key=lambda item: item["retry_at"])
+    return {"blocked": True, **latest}
+
+
+async def _read_codex_rate_limit_state() -> dict | None:
+    binary = _resolve_codex_app_server_path()
+    if not binary:
+        logger.warning("Codex App Server 실행 파일을 찾지 못해 오류 문구 기반 재시각을 사용합니다.")
+        return None
+
+    kwargs = dict(
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        cwd=os.path.dirname(__file__),
+        limit=4 * 1024 * 1024,
+    )
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            binary, "app-server", "--listen", "stdio://", **kwargs,
+        )
+
+        async def read_response(wanted_id: int) -> dict:
+            async def _read_loop():
+                while True:
+                    raw = await _read_jsonl_line(proc.stdout)
+                    if not raw:
+                        raise RuntimeError("Codex App Server stdout closed")
+                    try:
+                        message = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if message.get("id") == wanted_id:
+                        return message
+            return await asyncio.wait_for(_read_loop(), timeout=10)
+
+        initialize = {
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": {
+                    "name": "discord_codex_supervisor",
+                    "title": "Discord Codex Supervisor",
+                    "version": "1.0.0",
+                }
+            },
+        }
+        proc.stdin.write((json.dumps(initialize) + "\n").encode("utf-8"))
+        await proc.stdin.drain()
+        initialized = await read_response(1)
+        if initialized.get("error"):
+            raise RuntimeError(str(initialized["error"]))
+
+        for message in (
+            {"method": "initialized", "params": {}},
+            {"method": "account/rateLimits/read", "id": 2, "params": {}},
+        ):
+            proc.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
+        await proc.stdin.drain()
+
+        response = await read_response(2)
+        if response.get("error"):
+            raise RuntimeError(str(response["error"]))
+        result = response.get("result")
+        if not isinstance(result, dict):
+            return None
+        return _codex_rate_limit_state_from_result(result)
+    except Exception as e:
+        logger.warning(f"Codex 사용량 조회 실패, 오류 문구 기반으로 대체: {e}")
+        return None
+    finally:
+        if proc and proc.returncode is None:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except Exception:
+                pass
+
+
+async def _resolve_codex_usage_retry_at(error_text: str) -> datetime:
+    state = await _read_codex_rate_limit_state()
+    if state and state.get("blocked") and isinstance(state.get("retry_at"), datetime):
+        return state["retry_at"]
+    parsed = _parse_codex_usage_reset_at(error_text)
+    if parsed:
+        return parsed + timedelta(seconds=CODEX_LIMIT_RETRY_GRACE_SECONDS)
+    return datetime.now() + timedelta(minutes=CODEX_DEFERRED_FALLBACK_RETRY_MINUTES)
+
+
 DEFAULT_PERMISSIONS = ["Bash(*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)"]
 
 # 이미지 첨부파일 저장 디렉토리
@@ -752,9 +1119,18 @@ async def cleanup_attachments():
     import time as _time
     now = _time.time()
     count = 0
+    protected = {
+        os.path.normcase(os.path.abspath(str(path)))
+        for job in codex_deferred_jobs.values()
+        for key in ("image_paths", "queued_image_paths")
+        for path in (job.get(key) or [])
+        if path
+    }
     try:
         for fname in os.listdir(ATTACH_DIR):
             fpath = os.path.join(ATTACH_DIR, fname)
+            if os.path.normcase(os.path.abspath(fpath)) in protected:
+                continue
             if os.path.isfile(fpath) and now - os.path.getmtime(fpath) > ATTACH_MAX_AGE:
                 os.remove(fpath)
                 count += 1
@@ -1028,7 +1404,11 @@ async def _stdout_reader(channel_id: int, proc: asyncio.subprocess.Process, queu
     """프로세스 stdout을 지속적으로 읽어 JSON 이벤트로 파싱 후 queue에 전달. EOF 시 sentinel 전송."""
     try:
         while True:
-            line = await proc.stdout.readline()
+            try:
+                line = await _read_jsonl_line(proc.stdout)
+            except JsonlLineTooLargeError as error:
+                logger.warning(f"채널 {channel_id}: Claude JSONL 초대형 줄 건너뜀: {error}")
+                continue
             if not line:
                 await queue.put({"__eof__": True})
                 return
@@ -1152,6 +1532,62 @@ async def kill_channel_proc(channel_id: int):
         logger.info(f"채널 {channel_id}: 프로세스 종료 (returncode={rc})")
 
 
+async def _terminate_process_tree(proc, *, timeout: float = 8.0):
+    """Codex 실행 프로세스와 그 아래 MCP/셸 자식까지 종료한다."""
+    if not proc:
+        return
+
+    if os.name == "nt":
+        # Codex가 cmd -> node -> codex.exe -> MCP 순으로 자식을 만들기 때문에
+        # proc.kill()만으로는 실제 작업이 고아 프로세스로 남는다.
+        try:
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill.exe", "/PID", str(proc.pid), "/T", "/F",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            await asyncio.wait_for(killer.wait(), timeout=timeout)
+        except (FileNotFoundError, asyncio.TimeoutError, ProcessLookupError, OSError):
+            pass
+
+    if getattr(proc, "returncode", None) is None:
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=2)
+    except (asyncio.TimeoutError, ProcessLookupError, OSError):
+        pass
+
+
+async def _stop_channel_codex_run(channel_id: int) -> bool:
+    """추적 중인 Codex 프로세스 트리와 진행 상태 갱신을 즉시 정리한다."""
+    run = channel_codex_runs.get(channel_id)
+    if not run:
+        return False
+
+    status_task = run.get("status_task")
+    if status_task and not status_task.done():
+        status_task.cancel()
+        await asyncio.gather(status_task, return_exceptions=True)
+
+    await _terminate_process_tree(run.get("proc"))
+
+    status_msg = run.get("status_msg")
+    if status_msg:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+    channel_status.pop(channel_id, None)
+    if channel_codex_runs.get(channel_id) is run:
+        channel_codex_runs.pop(channel_id, None)
+    return True
+
+
 async def get_or_spawn_proc(channel_id: int, work_dir: str) -> dict:
     """기존 세션 반환 또는 신규 생성. 프로세스 죽었거나 work_dir 변경 시 재생성."""
     session = channel_claude_procs.get(channel_id)
@@ -1194,8 +1630,9 @@ async def send_user_message(session: dict, content: str):
 MAX_RETRIES = 2
 
 CODEX_PROGRESS_MAX_ENTRIES = 7
-CODEX_PROGRESS_REFRESH_SECONDS = 1.0
-CODEX_PROGRESS_HEARTBEAT_SECONDS = 15.0
+CODEX_PROGRESS_REFRESH_SECONDS = 2.0
+CODEX_PROGRESS_HEARTBEAT_SECONDS = 30.0
+CODEX_COMPLETED_EXIT_GRACE_SECONDS = 1.0
 
 
 def _format_codex_elapsed(seconds: float) -> str:
@@ -1310,6 +1747,14 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
             except Exception:
                 pass
         return "오류 발생: codex CLI를 찾을 수 없습니다. `npm i -g @openai/codex` 후 PATH 확인."
+
+    run_state = {
+        "proc": proc,
+        "status_task": None,
+        "status_msg": status_msg,
+    }
+    if channel_id:
+        channel_codex_runs[channel_id] = run_state
 
     def _short_status_text(value, limit: int = 100) -> str:
         if value is None:
@@ -1446,6 +1891,7 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
                 await status_msg.edit(content=text[:1900])
             else:
                 status_msg = await status_channel.send(text[:1900])
+                run_state["status_msg"] = status_msg
             channel_status[channel_id] = text
             last_status_edit = time.monotonic()
         except Exception:
@@ -1494,35 +1940,44 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
             except Exception:
                 pass
             status_msg = None
+        run_state["status_task"] = None
+        run_state["status_msg"] = None
+        if channel_id and channel_codex_runs.get(channel_id) is run_state:
+            channel_codex_runs.pop(channel_id, None)
 
     if status_channel:
         status_pump_task = asyncio.create_task(_codex_status_pump())
+        run_state["status_task"] = status_pump_task
         status_changed.set()
 
     stderr_task = asyncio.create_task(proc.stderr.read())
-    try:
-        proc.stdin.write(prompt.encode("utf-8"))
-        await proc.stdin.drain()
-        proc.stdin.close()
-    except Exception:
-        pass
 
     # JSONL 파싱
     agent_messages: list[str] = []
     new_thread_id: str | None = None
     usage_info: dict | None = None
     error_messages: list[str] = []
+    cancelled = False
+    turn_completed = False
     try:
+        try:
+            proc.stdin.write(prompt.encode("utf-8"))
+            await proc.stdin.drain()
+            proc.stdin.close()
+        except (BrokenPipeError, ConnectionError, OSError):
+            pass
+
         while True:
+            # turn.completed가 오기 전까지는 장시간 도구 실행도 끝까지 기다린다.
+            # 완료 뒤에는 stdout EOF를 기다리지 않는다. 하위 프로세스가 파이프를
+            # 붙잡고 있으면 작업은 끝났는데 Discord 상태만 계속 남을 수 있기 때문이다.
             try:
-                raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=1800)
-            except asyncio.TimeoutError:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                await _remove_codex_status()
-                return "⏰ 타임아웃: Codex 응답 30분 초과"
+                raw_line = await _read_jsonl_line(proc.stdout)
+            except JsonlLineTooLargeError as error:
+                logger.warning(f"채널 {channel_id}: Codex JSONL 초대형 줄 건너뜀: {error}")
+                error_messages.append(str(error))
+                _queue_codex_progress(("jsonl:error", "⚠️ 초대형 도구 출력 1건 건너뜀", True))
+                continue
 
             if not raw_line:
                 break
@@ -1556,14 +2011,45 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
                     error_messages.append(str(msg))
             elif t == "turn.completed":
                 usage_info = ev.get("usage")
+                turn_completed = True
+                logger.info(f"채널 {channel_id}: Codex turn.completed 수신, 결과 확정")
+                break
+    except asyncio.CancelledError:
+        cancelled = True
+        await _terminate_process_tree(proc)
+        if not stderr_task.done():
+            stderr_task.cancel()
+            await asyncio.gather(stderr_task, return_exceptions=True)
+        await _remove_codex_status()
+        logger.info(f"채널 {channel_id}: Codex 실행 취소 완료 (세션 유지: {resume_id or new_thread_id})")
+        raise
+    except Exception:
+        await _terminate_process_tree(proc)
+        if not stderr_task.done():
+            stderr_task.cancel()
+            await asyncio.gather(stderr_task, return_exceptions=True)
+        await _remove_codex_status()
+        raise
     finally:
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+        if proc.returncode is None:
+            if cancelled:
+                await _terminate_process_tree(proc)
+            elif turn_completed:
+                # 정상 종료할 짧은 여유만 준 뒤 남은 MCP/셸 자식까지 정리한다.
+                try:
+                    await asyncio.wait_for(
+                        proc.wait(), timeout=CODEX_COMPLETED_EXIT_GRACE_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.info(
+                        f"채널 {channel_id}: 완료 후 Codex 프로세스가 남아 있어 정리"
+                    )
+                    await _terminate_process_tree(proc)
+            else:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    await _terminate_process_tree(proc)
 
     try:
         stderr = await asyncio.wait_for(stderr_task, timeout=2)
@@ -1579,16 +2065,37 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
     # 진행 중 commentary는 패널에 보여주고, 완료 후에는 마지막 결론만 남긴다.
     result_text = agent_messages[-1].strip() if agent_messages else ""
 
-    if proc.returncode != 0:
-        err_tail = stderr.decode("utf-8", errors="replace").strip()[-500:]
+    # turn.completed 이후 잔여 프로세스를 강제 정리한 종료 코드는 실패가 아니다.
+    if not turn_completed and proc.returncode != 0:
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+        combined_error = "\n".join(part for part in (
+            stderr_text,
+            "\n".join(error_messages),
+        ) if part).strip()
+        err_tail = stderr_text[-500:]
         if not err_tail and error_messages:
             err_tail = "\n".join(error_messages)[-1000:]
         logger.warning(f"Codex returncode={proc.returncode} stderr: {err_tail}")
-        # 실패한 resume은 다음 시도에서 fresh로 시작하게 정리
-        if resume_id:
+
+        if _is_codex_usage_limit_error(combined_error):
+            retry_at = await _resolve_codex_usage_retry_at(combined_error)
+            thread_id = resume_id or new_thread_id
+            if thread_id and channel_id:
+                channel_codex_sessions[channel_id] = thread_id
+                save_codex_sessions()
+            await _remove_codex_status()
+            raise CodexUsageLimitError(
+                err_tail or "Codex 사용량 제한에 도달했습니다.",
+                retry_at=retry_at,
+                thread_id=thread_id,
+            )
+
+        # 강제 중지·일시적 CLI 오류로 맥락을 잃지 않도록, 실제로 스레드가
+        # 존재하지 않는다는 오류가 확인된 경우에만 fresh start로 전환한다.
+        if resume_id and _is_codex_missing_thread_error(combined_error):
             channel_codex_sessions.pop(channel_id, None)
             save_codex_sessions()
-            logger.warning(f"채널 {channel_id}: 실패한 codex thread_id 폐기")
+            logger.warning(f"채널 {channel_id}: 존재하지 않는 codex thread_id 폐기")
         if not result_text:
             await _remove_codex_status()
             return f"오류 발생: Codex 종료 (returncode={proc.returncode})\n{err_tail}"
@@ -1787,17 +2294,8 @@ async def _run_claude_once(prompt: str, work_dir: str, channel_id: int = 0,
                 last_edit_time = now
 
             while True:
-                try:
-                    data = await asyncio.wait_for(event_queue.get(), timeout=1800)
-                except asyncio.TimeoutError:
-                    await kill_channel_proc(channel_id)
-                    channel_status.pop(channel_id, None)
-                    if status_msg:
-                        try:
-                            await status_msg.delete()
-                        except Exception:
-                            pass
-                    return "⏰ 타임아웃: 30분을 초과했습니다."
+                # 장시간 도구 실행도 끝까지 기다린다. 사용자는 `중지` 명령으로 직접 취소할 수 있다.
+                data = await event_queue.get()
 
                 # 프로세스 EOF (예기치 않은 종료)
                 if data.get("__eof__"):
@@ -2327,10 +2825,371 @@ async def _prepare_prompt(message: discord.Message) -> tuple[str, list[str]]:
     return prompt, image_paths
 
 
+def _deferred_datetime_text(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _deferred_datetime(value, default: datetime | None = None) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return default or datetime.now()
+
+
+def _append_deferred_request(channel_id: int, prompt: str, image_paths: list[str] | None = None) -> dict | None:
+    job = codex_deferred_jobs.get(channel_id)
+    if not job:
+        return None
+    clean_prompt = str(prompt or "").strip()
+    if clean_prompt:
+        job.setdefault("queued_prompts", []).append(clean_prompt)
+    queued_images = job.setdefault("queued_image_paths", [])
+    for path in image_paths or []:
+        if path and path not in queued_images:
+            queued_images.append(path)
+    job["updated_at"] = _deferred_datetime_text(datetime.now())
+    save_codex_deferred_jobs()
+    return job
+
+
+def _cancel_deferred_codex_job(channel_id: int) -> bool:
+    removed = codex_deferred_jobs.pop(channel_id, None)
+    if removed is not None:
+        save_codex_deferred_jobs()
+        logger.info(f"채널 {channel_id}: Codex 자동 재개 대기 작업 취소")
+        return True
+    return False
+
+
+async def _park_codex_job(
+    channel,
+    channel_id: int,
+    prompt: str,
+    work_dir: str,
+    image_paths: list[str] | None,
+    error: CodexUsageLimitError,
+    *,
+    source: str,
+    source_message_id: int | None = None,
+    scheduled_job_id: str | None = None,
+) -> dict:
+    now = datetime.now()
+    existing = codex_deferred_jobs.get(channel_id)
+    if existing:
+        _append_deferred_request(channel_id, prompt, image_paths)
+        existing["retry_at"] = _deferred_datetime_text(error.retry_at)
+        existing["thread_id"] = error.thread_id or existing.get("thread_id")
+        existing["last_error"] = str(error)[-2000:]
+        existing["updated_at"] = _deferred_datetime_text(now)
+        save_codex_deferred_jobs()
+        job = existing
+    else:
+        job = {
+            "channel_id": channel_id,
+            "source": source,
+            "source_message_id": source_message_id,
+            "scheduled_job_id": scheduled_job_id,
+            "work_dir": work_dir,
+            "prompt": str(prompt or "").strip(),
+            "image_paths": list(dict.fromkeys(image_paths or [])),
+            "queued_prompts": [],
+            "queued_image_paths": [],
+            "thread_id": error.thread_id,
+            "retry_at": _deferred_datetime_text(error.retry_at),
+            "created_at": _deferred_datetime_text(now),
+            "updated_at": _deferred_datetime_text(now),
+            "resume_attempts": 0,
+            "non_quota_failures": 0,
+            "last_error": str(error)[-2000:],
+            "last_claude_audit_at": None,
+        }
+        codex_deferred_jobs[channel_id] = job
+        save_codex_deferred_jobs()
+
+    try:
+        await channel.send(
+            "⏸️ **Codex 사용량 제한으로 작업을 보관했습니다.**\n"
+            f"자동 재개 예정: `{job['retry_at']}`\n"
+            "봇을 재시작해도 유지되며, `중지` 또는 `리셋`으로 예약을 취소할 수 있습니다."
+        )
+    except Exception:
+        pass
+    logger.info(
+        f"채널 {channel_id}: Codex 작업 자동 재개 대기 retry_at={job.get('retry_at')} "
+        f"thread={job.get('thread_id')}"
+    )
+    return job
+
+
+def _build_deferred_resume_prompt(job: dict, consumed_prompts: list[str]) -> str:
+    original = str(job.get("prompt", "")).strip()
+    additional = "\n\n".join(str(p).strip() for p in consumed_prompts if str(p).strip())
+    parts = [
+        "[Codex 사용량 제한 해제 후 자동 재개]",
+        "이전 작업이 사용량 제한으로 중단되었습니다. 현재 파일과 작업 상태를 먼저 확인하고, "
+        "이미 완료된 변경은 반복하지 말고 남은 작업부터 이어서 완료해 주세요.",
+    ]
+    if original:
+        parts.append(f"원래 요청:\n{original}")
+    if additional:
+        parts.append(f"대기 중 추가 요청:\n{additional}")
+    return "\n\n".join(parts)
+
+
+async def _run_claude_readonly_audit(prompt: str, work_dir: str) -> str:
+    args = [
+        "-p",
+        "--output-format", "json",
+        "--tools", "Read,Glob,Grep",
+    ]
+    if os.name == "nt" and CLAUDE_PATH.lower().endswith((".cmd", ".bat")):
+        cmd = ["cmd.exe", "/c", CLAUDE_PATH] + args
+    else:
+        cmd = [CLAUDE_PATH] + args
+
+    kwargs = dict(
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=work_dir,
+    )
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+    proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
+    try:
+        stdout, stderr = await proc.communicate(prompt.encode("utf-8"))
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+        if proc.returncode != 0:
+            return f"Claude 읽기 전용 감독 실패 (returncode={proc.returncode}): {stderr_text[-1000:]}"
+
+        output = stdout.decode("utf-8", errors="replace").strip()
+        try:
+            data = json.loads(output)
+            if isinstance(data, dict):
+                result = data.get("result")
+                if isinstance(result, str) and result.strip():
+                    return result.strip()
+        except json.JSONDecodeError:
+            pass
+        return output or "Claude 읽기 전용 감독 결과가 비어 있습니다."
+    finally:
+        if proc.returncode is None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+
+
+async def _run_deferred_claude_audit(channel, channel_id: int, job: dict, error_text: str):
+    now = datetime.now()
+    last_audit = _deferred_datetime(job.get("last_claude_audit_at"), default=datetime.min)
+    if now - last_audit < timedelta(minutes=CODEX_CLAUDE_AUDIT_INTERVAL_MINUTES):
+        return
+
+    job["last_claude_audit_at"] = _deferred_datetime_text(now)
+    save_codex_deferred_jobs()
+    try:
+        await channel.send(
+            f"🕵️ Codex 자동 재개가 {job.get('non_quota_failures', 0)}회 실패해 "
+            "Claude 감독 점검을 시작합니다."
+        )
+    except Exception:
+        pass
+
+    audit_prompt = (
+        "[Codex 자동 재개 감독 점검]\n"
+        "읽기 전용 진단입니다. 파일 수정, Write/Edit, 명령 실행, 외부 전송을 하지 마세요. "
+        "현재 저장소 상태와 아래 실패 정보를 확인하여 가능한 원인과 사용자가 취할 조치만 간단히 보고하세요.\n\n"
+        f"작업 폴더: {job.get('work_dir')}\n"
+        f"재개 실패 횟수: {job.get('non_quota_failures', 0)}\n"
+        f"마지막 오류: {str(error_text)[-1500:]}\n"
+        f"원래 요청 요약: {str(job.get('prompt', ''))[:1000]}"
+    )
+    try:
+        result = await _run_claude_readonly_audit(
+            audit_prompt,
+            str(job.get("work_dir") or WORKING_DIR),
+        )
+        for i, chunk in enumerate(split_message(result, limit=1800)):
+            prefix = "🕵️ **Claude 감독 보고**\n" if i == 0 else ""
+            await channel.send(prefix + chunk)
+    except Exception as e:
+        logger.warning(f"채널 {channel_id}: Claude 감독 점검 실패: {e}")
+
+
+async def _run_deferred_codex_job(bot: commands.Bot, channel_id: int):
+    job = codex_deferred_jobs.get(channel_id)
+    if not job:
+        return
+
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception as e:
+            logger.warning(f"Codex 자동 재개 채널 조회 실패 ({channel_id}): {e}")
+            job["retry_at"] = _deferred_datetime_text(
+                datetime.now() + timedelta(minutes=CODEX_DEFERRED_BUSY_RETRY_MINUTES)
+            )
+            job.pop("running", None)
+            job.pop("started_at", None)
+            save_codex_deferred_jobs()
+            return
+
+    if channel_busy.get(channel_id):
+        job["retry_at"] = _deferred_datetime_text(
+            datetime.now() + timedelta(minutes=CODEX_DEFERRED_BUSY_RETRY_MINUTES)
+        )
+        job.pop("running", None)
+        job.pop("started_at", None)
+        save_codex_deferred_jobs()
+        return
+
+    state = await _read_codex_rate_limit_state()
+    if state and state.get("blocked") and isinstance(state.get("retry_at"), datetime):
+        job["retry_at"] = _deferred_datetime_text(state["retry_at"])
+        job["updated_at"] = _deferred_datetime_text(datetime.now())
+        job.pop("running", None)
+        job.pop("started_at", None)
+        save_codex_deferred_jobs()
+        logger.info(f"채널 {channel_id}: Codex 제한 지속, 재개 연기 {job['retry_at']}")
+        return
+
+    # 사용량 조회 중 사용자가 `중지`/`리셋`으로 대기 작업을 취소했을 수 있다.
+    if codex_deferred_jobs.get(channel_id) is not job:
+        return
+
+    consumed_prompts = list(job.get("queued_prompts") or [])
+    consumed_images = list(job.get("queued_image_paths") or [])
+    job["queued_prompts"] = []
+    job["queued_image_paths"] = []
+    job["resume_attempts"] = int(job.get("resume_attempts", 0)) + 1
+    job["updated_at"] = _deferred_datetime_text(datetime.now())
+    save_codex_deferred_jobs()
+
+    channel_busy[channel_id] = True
+    current_task = asyncio.current_task()
+    if current_task:
+        channel_tasks[channel_id] = current_task
+    try:
+        thread_id = job.get("thread_id")
+        if thread_id:
+            channel_codex_sessions[channel_id] = str(thread_id)
+            save_codex_sessions()
+
+        await channel.send(
+            f"▶️ **Codex 사용량 복구 확인 · 자동 재개 시작** "
+            f"(시도 {job['resume_attempts']}회)"
+        )
+        work_dir = str(job.get("work_dir") or channel_workdirs.get(channel_id, WORKING_DIR))
+        resume_prompt = _build_deferred_resume_prompt(job, consumed_prompts)
+        engine_prompt = add_screenshot_output_instruction(resume_prompt, work_dir)
+        all_images = list(dict.fromkeys(list(job.get("image_paths") or []) + consumed_images))
+        turn_started_at = time.time() - 1.0
+        result = await run_codex(
+            engine_prompt,
+            work_dir,
+            channel_id=channel_id,
+            image_paths=all_images,
+            status_channel=channel,
+            reply_to=None,
+        )
+        if result.startswith("오류") or result == "(빈 응답)":
+            raise RuntimeError(result)
+        await send_screenshot_outputs_if_requested(
+            channel, resume_prompt, work_dir, turn_started_at, result,
+        )
+
+        current = codex_deferred_jobs.get(channel_id)
+        if current and (current.get("queued_prompts") or []):
+            current["prompt"] = "\n\n".join(current.get("queued_prompts") or [])
+            current["image_paths"] = list(current.get("queued_image_paths") or [])
+            current["queued_prompts"] = []
+            current["queued_image_paths"] = []
+            current["thread_id"] = channel_codex_sessions.get(channel_id)
+            current["retry_at"] = _deferred_datetime_text(datetime.now() + timedelta(seconds=5))
+            current["resume_attempts"] = 0
+            current["non_quota_failures"] = 0
+            current["updated_at"] = _deferred_datetime_text(datetime.now())
+            save_codex_deferred_jobs()
+            await channel.send("📥 자동 재개 중 들어온 추가 요청도 이어서 처리할 예정입니다.")
+        else:
+            codex_deferred_jobs.pop(channel_id, None)
+            save_codex_deferred_jobs()
+            await channel.send("✅ **보관된 Codex 작업 자동 재개 완료**")
+    except CodexUsageLimitError as e:
+        current = codex_deferred_jobs.get(channel_id, job)
+        current["queued_prompts"] = consumed_prompts + list(current.get("queued_prompts") or [])
+        current["queued_image_paths"] = list(dict.fromkeys(
+            consumed_images + list(current.get("queued_image_paths") or [])
+        ))
+        current["thread_id"] = e.thread_id or current.get("thread_id")
+        current["retry_at"] = _deferred_datetime_text(e.retry_at)
+        current["last_error"] = str(e)[-2000:]
+        current["updated_at"] = _deferred_datetime_text(datetime.now())
+        codex_deferred_jobs[channel_id] = current
+        save_codex_deferred_jobs()
+        await channel.send(f"⏸️ Codex 제한이 계속되어 `{current['retry_at']}`에 다시 시도합니다.")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        current = codex_deferred_jobs.get(channel_id, job)
+        current["queued_prompts"] = consumed_prompts + list(current.get("queued_prompts") or [])
+        current["queued_image_paths"] = list(dict.fromkeys(
+            consumed_images + list(current.get("queued_image_paths") or [])
+        ))
+        current["non_quota_failures"] = int(current.get("non_quota_failures", 0)) + 1
+        current["last_error"] = str(e)[-2000:]
+        current["retry_at"] = _deferred_datetime_text(
+            datetime.now() + timedelta(minutes=CODEX_DEFERRED_FALLBACK_RETRY_MINUTES)
+        )
+        current["updated_at"] = _deferred_datetime_text(datetime.now())
+        codex_deferred_jobs[channel_id] = current
+        save_codex_deferred_jobs()
+        logger.error(f"채널 {channel_id}: Codex 자동 재개 실패: {e}", exc_info=True)
+        await channel.send(
+            f"⚠️ Codex 자동 재개 실패 ({current['non_quota_failures']}회). "
+            f"`{current['retry_at']}`에 다시 시도합니다."
+        )
+        if current["non_quota_failures"] >= CODEX_CLAUDE_AUDIT_FAILURE_THRESHOLD:
+            await _run_deferred_claude_audit(channel, channel_id, current, str(e))
+    finally:
+        channel_busy[channel_id] = False
+        if channel_tasks.get(channel_id) is current_task:
+            channel_tasks.pop(channel_id, None)
+        channel_status.pop(channel_id, None)
+        current = codex_deferred_jobs.get(channel_id)
+        if current:
+            current.pop("running", None)
+            current.pop("started_at", None)
+            save_codex_deferred_jobs()
+        else:
+            # 자동 재개 완료 메시지를 보내는 짧은 사이에 들어온 일반 요청도 놓치지 않는다.
+            pending_list = channel_pending.pop(channel_id, None) or []
+            if pending_list:
+                prompts = [item[0] for item in pending_list]
+                images = [path for item in pending_list for path in item[2]]
+                pending_message = pending_list[-1][1]
+                channel_busy[channel_id] = True
+                task = asyncio.create_task(_process_channel(
+                    channel_id,
+                    "\n\n".join(prompts),
+                    pending_message,
+                    images,
+                ))
+                channel_tasks[channel_id] = task
+
+
 async def _process_channel(ch_id: int, prompt: str, message: discord.Message, image_paths: list[str]):
     """채널의 Claude 작업을 실행하고, 끝나면 대기 중인 메시지들을 합쳐서 이어서 처리"""
+    current_task = asyncio.current_task()
     try:
         while True:
+            quota_parked = False
             try:
                 work_dir = channel_workdirs.get(ch_id, WORKING_DIR)
                 # typing() 진입 실패(Discord 503 등)해도 턴 자체는 계속 진행
@@ -2363,12 +3222,37 @@ async def _process_channel(ch_id: int, prompt: str, message: discord.Message, im
                 await send_screenshot_outputs_if_requested(message.channel, prompt, work_dir, turn_started_at, result)
             except asyncio.CancelledError:
                 raise
+            except CodexUsageLimitError as e:
+                await _park_codex_job(
+                    message.channel,
+                    ch_id,
+                    prompt,
+                    work_dir,
+                    image_paths,
+                    e,
+                    source="message",
+                    source_message_id=getattr(message, "id", None),
+                )
+                quota_parked = True
             except Exception as e:
                 logger.error(f"메시지 처리 중 오류: {e}", exc_info=True)
                 try:
                     await message.reply(f"```\n오류 발생: {e}\n```")
                 except Exception:
                     pass
+
+            if quota_parked:
+                pending_list = channel_pending.pop(ch_id, None) or []
+                for p_prompt, _p_msg, p_images in pending_list:
+                    _append_deferred_request(ch_id, p_prompt, p_images)
+                if pending_list:
+                    try:
+                        await message.channel.send(
+                            f"📥 작업 중 들어온 추가 요청 {len(pending_list)}개도 자동 재개 대기열에 보관했습니다."
+                        )
+                    except Exception:
+                        pass
+                break
 
             # 대기 중인 메시지들을 합쳐서 처리
             pending_list = channel_pending.pop(ch_id, None)
@@ -2387,12 +3271,14 @@ async def _process_channel(ch_id: int, prompt: str, message: discord.Message, im
                 break
     finally:
         channel_busy[ch_id] = False
-        channel_tasks.pop(ch_id, None)
+        if channel_tasks.get(ch_id) is current_task:
+            channel_tasks.pop(ch_id, None)
         channel_status.pop(ch_id, None)
 
 
 async def _run_scheduled_job(bot: commands.Bot, job_id: str, job: dict):
     ch_id = int(job.get("channel_id", 0))
+    current_task = asyncio.current_task()
     channel = bot.get_channel(ch_id)
     if channel is None:
         try:
@@ -2427,6 +3313,8 @@ async def _run_scheduled_job(bot: commands.Bot, job_id: str, job: dict):
         return
 
     channel_busy[ch_id] = True
+    if current_task:
+        channel_tasks[ch_id] = current_task
     try:
         await channel.send(f"⏰ 예약 작업 `{job_id}` 시작")
         work_dir = channel_workdirs.get(ch_id, WORKING_DIR)
@@ -2451,6 +3339,40 @@ async def _run_scheduled_job(bot: commands.Bot, job_id: str, job: dict):
             job.pop("running", None)
             job.pop("started_at", None)
             save_schedules()
+    except CodexUsageLimitError as e:
+        await _park_codex_job(
+            channel,
+            ch_id,
+            prompt,
+            work_dir,
+            None,
+            e,
+            source="scheduled",
+            scheduled_job_id=job_id,
+        )
+        if job.get("mode") == "once":
+            scheduled_jobs.pop(job_id, None)
+            save_schedules(deleted_ids={job_id})
+        else:
+            next_run = _next_run_for(str(job.get("mode")), str(job.get("when")))
+            job["next_run"] = next_run.strftime("%Y-%m-%d %H:%M:%S") if next_run else None
+            job.pop("running", None)
+            job.pop("started_at", None)
+            save_schedules()
+    except asyncio.CancelledError:
+        # 수동 중지는 이번 실행만 끝낸다. 반복 예약은 다음 정상 주기로 넘기고,
+        # 1회 예약은 다시 즉시 실행되지 않도록 제거한다.
+        if job.get("mode") == "once":
+            scheduled_jobs.pop(job_id, None)
+            save_schedules(deleted_ids={job_id})
+        else:
+            next_run = _next_run_for(str(job.get("mode")), str(job.get("when")))
+            job["next_run"] = next_run.strftime("%Y-%m-%d %H:%M:%S") if next_run else None
+            job.pop("running", None)
+            job.pop("started_at", None)
+            save_schedules()
+        logger.info(f"예약 작업 {job_id}: 사용자 중지로 현재 실행 취소")
+        raise
     except Exception as e:
         logger.error(f"예약 작업 {job_id} 실행 실패: {e}", exc_info=True)
         try:
@@ -2463,11 +3385,14 @@ async def _run_scheduled_job(bot: commands.Bot, job_id: str, job: dict):
         save_schedules()
     finally:
         channel_busy[ch_id] = False
+        if channel_tasks.get(ch_id) is current_task:
+            channel_tasks.pop(ch_id, None)
+        channel_status.pop(ch_id, None)
 
 
 async def _scheduler_loop(bot: commands.Bot):
     await bot.wait_until_ready()
-    logger.info("예약 작업 스케줄러 시작")
+    logger.info("예약 작업 + Codex 자동 재개 스케줄러 시작")
     while not bot.is_closed():
         try:
             now = datetime.now()
@@ -2498,9 +3423,53 @@ async def _scheduler_loop(bot: commands.Bot):
                 job["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 save_schedules()
                 asyncio.create_task(_run_scheduled_job(bot, job_id, job))
+
+            for channel_id, job in list(codex_deferred_jobs.items()):
+                if job.get("running"):
+                    continue
+                retry_at = _deferred_datetime(job.get("retry_at"), default=now)
+                if retry_at > now:
+                    continue
+                job["running"] = True
+                job["started_at"] = _deferred_datetime_text(now)
+                save_codex_deferred_jobs()
+                asyncio.create_task(_run_deferred_codex_job(bot, channel_id))
         except Exception as e:
             logger.error(f"예약 스케줄러 오류: {e}", exc_info=True)
         await asyncio.sleep(30)
+
+
+async def _stop_channel_execution(channel_id: int) -> bool:
+    """현재 실행과 자동 재개를 멈추되 Claude/Codex 대화 세션 ID는 유지한다."""
+    channel_pending.pop(channel_id, None)
+    had_work = _cancel_deferred_codex_job(channel_id)
+
+    task = channel_tasks.get(channel_id)
+    if task and not task.done():
+        task.cancel()
+        had_work = True
+
+    if await _stop_channel_codex_run(channel_id):
+        had_work = True
+
+    if channel_id in channel_claude_procs:
+        await kill_channel_proc(channel_id)
+        had_work = True
+
+    if task and not task.done():
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(task, return_exceptions=True),
+                timeout=10,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"채널 {channel_id}: 중지 태스크 정리 10초 초과")
+
+    if channel_tasks.get(channel_id) is task:
+        channel_tasks.pop(channel_id, None)
+    channel_busy[channel_id] = False
+    channel_status.pop(channel_id, None)
+    return had_work
 
 
 async def _handle_message(message: discord.Message, bot: commands.Bot):
@@ -2517,31 +3486,17 @@ async def _handle_message(message: discord.Message, bot: commands.Bot):
         ch_id = message.channel.id
 
         # 중지 명령 (태스크 cancel + 프로세스 종료, 세션 ID 유지)
-        if prompt in ("중지", "stop", "멈춰", "esc"):
-            channel_pending.pop(ch_id, None)
-            task = channel_tasks.get(ch_id)
-            had_work = False
-            if task and not task.done():
-                task.cancel()
-                had_work = True
-            if ch_id in channel_claude_procs:
-                await kill_channel_proc(ch_id)
-                had_work = True
-            channel_busy[ch_id] = False
+        if prompt.casefold() in ("중지", "중지해줘", "stop", "멈춰", "멈춰줘", "취소", "esc"):
+            had_work = await _stop_channel_execution(ch_id)
             if had_work:
-                await message.reply("실행 중인 작업을 중지했습니다.")
+                await message.reply("실행 중인 작업을 중지했습니다. 대화 맥락은 유지됩니다.")
             else:
                 await message.reply("실행 중인 작업이 없습니다.")
             return
 
         # 리셋 명령 (태스크 cancel + 프로세스 종료 + 세션 ID 삭제)
         if prompt in ("리셋", "reset", "새대화"):
-            channel_pending.pop(ch_id, None)
-            task = channel_tasks.get(ch_id)
-            if task and not task.done():
-                task.cancel()
-            await kill_channel_proc(ch_id)
-            channel_busy[ch_id] = False
+            await _stop_channel_execution(ch_id)
             channel_sessions.pop(ch_id, None)
             save_sessions()
             channel_codex_sessions.pop(ch_id, None)
@@ -2550,6 +3505,17 @@ async def _handle_message(message: discord.Message, bot: commands.Bot):
             return
 
         prompt, image_paths = await _prepare_prompt(message)
+
+        backend = channel_backends.get(ch_id, DEFAULT_BACKEND)
+        if backend == "codex" and ch_id in codex_deferred_jobs:
+            job = _append_deferred_request(ch_id, prompt, image_paths)
+            retry_at = job.get("retry_at") if job else "확인 중"
+            queued_count = len(job.get("queued_prompts") or []) if job else 0
+            await message.reply(
+                f"📥 Codex 자동 재개 대기열에 추가했습니다. "
+                f"(추가 요청 {queued_count}개, 재개 예정 `{retry_at}`)"
+            )
+            return
 
         # 현재 작업 중이면 조용히 대기 큐에 추가 (CLI처럼 자연스럽게)
         if channel_busy.get(ch_id):
@@ -2663,15 +3629,35 @@ def _register_events(bot: commands.Bot):
 
         work_dir = channel_workdirs.get(ctx.channel.id, WORKING_DIR)
         backend = channel_backends.get(ctx.channel.id, DEFAULT_BACKEND)
+        if backend == "codex" and ctx.channel.id in codex_deferred_jobs:
+            job = _append_deferred_request(ctx.channel.id, prompt, image_paths)
+            await ctx.reply(
+                f"📥 Codex 자동 재개 대기열에 추가했습니다. "
+                f"(재개 예정 `{job.get('retry_at') if job else '확인 중'}`)"
+            )
+            return
         engine = run_codex if backend == "codex" else run_claude
         engine_prompt = add_screenshot_output_instruction(prompt, work_dir)
-        async with ctx.typing():
-            import time as _time
-            turn_started_at = _time.time() - 1.0
-            result = await engine(engine_prompt, work_dir, channel_id=ctx.channel.id,
-                                  image_paths=image_paths,
-                                  status_channel=ctx.channel,
-                                  reply_to=ctx.message)
+        try:
+            async with ctx.typing():
+                import time as _time
+                turn_started_at = _time.time() - 1.0
+                result = await engine(engine_prompt, work_dir, channel_id=ctx.channel.id,
+                                      image_paths=image_paths,
+                                      status_channel=ctx.channel,
+                                      reply_to=ctx.message)
+        except CodexUsageLimitError as e:
+            await _park_codex_job(
+                ctx.channel,
+                ctx.channel.id,
+                prompt,
+                work_dir,
+                image_paths,
+                e,
+                source="prefix",
+                source_message_id=getattr(ctx.message, "id", None),
+            )
+            return
 
         if result.startswith("⏰") or result.startswith("오류") or result == "(빈 응답)":
             await ctx.reply(f"```\n{result}\n```")
@@ -2972,6 +3958,14 @@ def _register_events(bot: commands.Bot):
         sent_msg = await interaction.followup.send(f"▶ `{prompt[:80]}`")
 
         ch_id = interaction.channel.id
+        backend = channel_backends.get(ch_id, DEFAULT_BACKEND)
+        if backend == "codex" and ch_id in codex_deferred_jobs:
+            job = _append_deferred_request(ch_id, prompt, [])
+            await interaction.followup.send(
+                f"📥 Codex 자동 재개 대기열에 추가했습니다. "
+                f"(재개 예정 `{job.get('retry_at') if job else '확인 중'}`)"
+            )
+            return
         if channel_busy.get(ch_id):
             channel_pending.setdefault(ch_id, []).append((prompt, sent_msg, []))
             return
