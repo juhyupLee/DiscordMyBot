@@ -1,5 +1,17 @@
 # DEVLOG
 
+## 2026-08-30
+- **Codex 사용량 가시화**: 매 응답 뒤 이번 턴 입력·캐시·출력·추론 토큰, 채널별 일일 누적·전체 채널 대비 비중, 계정 한도 잔량과 초기화 시각을 간결하게 표시
+- 사용량 통계를 `codex_usage_stats.json`에 날짜·채널별로 90일간 보존하고 App Server 한도 조회는 캐시해 불필요한 호출을 줄임
+- **Discord 결과 전달 개선**: Codex 최종 답변을 코드블록 대신 Discord Markdown으로 전송해 URL과 로컬 파일 링크가 읽기 좋게 표시되도록 변경하고 실제 멘션은 차단
+- 최종 답변에 존재하는 PNG/JPG 등 이미지 경로가 있으면 명시적인 스크린샷 요청이 없어도 파일을 자동 첨부하며 Markdown 링크·코드 경로·상대 경로·파일명 형식을 지원
+- **Codex 플러그인 스킬 통합**: `~/.codex/plugins/cache`와 Claude 플러그인 캐시의 변경 가능한 구조를 재귀 탐색해 `/skill` 자동완성과 `!skill list/show`에 프로젝트·글로벌·플러그인 스킬을 함께 노출
+- **Codex 진단·세션 관리**: `!doctor`/`/doctor`로 redacted `codex doctor --json` 결과를 요약하고, `!session`/`/session`으로 현재 thread 확인·fork·archive 지원
+- **재시작 대기열 복구**: 작업 중 들어온 일반 요청을 `channel_pending_jobs.json`에 저장해 봇 재시작 후 이어서 처리하고, 중지 시 Ctrl+Break 정상 종료를 먼저 시도한 뒤 `taskkill /T /F`로 fallback
+- Claude Opus 5.0 선택 별칭과 Codex 모델별 추론 강도 선택을 최신 모델 캐시에 맞춰 보강
+- 완료 판정, 사용량, Markdown, 이미지 첨부, 플러그인·진단·세션, 대기열·중지 동작을 포함한 자동 테스트 30개 통과
+- Codex CLI 안정판 `0.150.1` 기준으로 동작 확인
+
 ## 2026-07-26
 - **Codex 완료 판정 안정화**: `turn.completed` 수신 즉시 최종 결과를 확정해, 실제 작업이 끝났는데도 자식 프로세스가 stdout EOF를 붙잡아 Discord 진행 패널만 계속 남던 문제 해결
 - 완료 신호 후 1초의 정상 종료 유예를 주고 남은 Codex/MCP/셸 프로세스 트리를 정리하며, 이 정리 과정의 종료 코드는 작업 실패로 오인하지 않도록 분리

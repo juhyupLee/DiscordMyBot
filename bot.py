@@ -9,6 +9,7 @@ import shlex
 import re
 import time
 import glob
+import signal
 from datetime import datetime, timedelta
 import aiohttp
 import discord
@@ -51,8 +52,10 @@ channel_tasks: dict[int, asyncio.Task] = {}
 # {channel_id: {"proc", "status_task", "status_msg"}}
 channel_codex_runs: dict[int, dict] = {}
 
-# 채널별 대기 중인 메시지 큐 (모아서 한 번에 전달)
-channel_pending: dict[int, list[tuple]] = {}  # {channel_id: [(prompt, message, image_paths), ...]}
+# 채널별 대기 중인 메시지 큐는 아래 CHANNEL_PENDING_FILE에서 복원한다.
+# 각 항목은 prompt/message_id/image_paths/created_at을 가진 dict이며, 실행 중에는
+# Discord message 객체를 선택적으로 "message" 키에 보관한다.
+channel_pending: dict[int, list[dict]] = {}
 # 채널별 현재 작업 상태 텍스트
 channel_status: dict[int, str] = {}
 # 채널별 직전 턴에서 Claude가 Write/Edit한 파일 (절대경로) — /files 다운로드용
@@ -67,6 +70,8 @@ CODEX_SESSIONS_FILE = os.path.join(os.path.dirname(__file__), "channel_codex_ses
 CODEX_MODELS_FILE = os.path.join(os.path.dirname(__file__), "channel_codex_models.json")
 CODEX_REASONING_FILE = os.path.join(os.path.dirname(__file__), "channel_reasoning.json")
 CODEX_DEFERRED_FILE = os.path.join(os.path.dirname(__file__), "codex_deferred_jobs.json")
+CODEX_USAGE_FILE = os.path.join(os.path.dirname(__file__), "codex_usage_stats.json")
+CHANNEL_PENDING_FILE = os.path.join(os.path.dirname(__file__), "channel_pending_jobs.json")
 CODEX_MODELS_CACHE_FILE = os.getenv(
     "CODEX_MODELS_CACHE_FILE",
     os.path.join(os.path.expanduser("~"), ".codex", "models_cache.json"),
@@ -79,7 +84,16 @@ CODEX_DEFERRED_BUSY_RETRY_MINUTES = 5
 CODEX_DEFERRED_FALLBACK_RETRY_MINUTES = 60
 CODEX_CLAUDE_AUDIT_FAILURE_THRESHOLD = 3
 CODEX_CLAUDE_AUDIT_INTERVAL_MINUTES = 60
+CODEX_USAGE_RETENTION_DAYS = 90
+CODEX_RATE_LIMIT_CACHE_SECONDS = 5 * 60
+CODEX_RATE_LIMIT_FAILURE_CACHE_SECONDS = 60
 JSONL_MAX_LINE_BYTES = 64 * 1024 * 1024
+CODEX_USAGE_TOKEN_FIELDS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+)
 
 
 class JsonlLineTooLargeError(ValueError):
@@ -238,6 +252,106 @@ def save_codex_deferred_jobs():
         json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, CODEX_DEFERRED_FILE)
 
+
+def load_channel_pending() -> dict[int, list[dict]]:
+    """재시작 전에 대기 중이던 일반 메시지를 안전한 직렬화 형태로 복원한다."""
+    try:
+        with open(CHANNEL_PENDING_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        restored: dict[int, list[dict]] = {}
+        for channel_id, entries in data.items():
+            if not isinstance(entries, list):
+                continue
+            clean_entries = []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                prompt = str(entry.get("prompt", "")).strip()
+                if not prompt:
+                    continue
+                images = entry.get("image_paths")
+                clean_entries.append({
+                    "prompt": prompt,
+                    "message_id": entry.get("message_id"),
+                    "image_paths": [str(path) for path in images if path]
+                    if isinstance(images, list) else [],
+                    "created_at": str(entry.get("created_at") or ""),
+                })
+            if clean_entries:
+                restored[int(channel_id)] = clean_entries
+        return restored
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError) as e:
+        if not isinstance(e, FileNotFoundError):
+            logger.warning(f"채널 대기열 로드 실패: {e}")
+        return {}
+
+
+def save_channel_pending():
+    payload = {}
+    for channel_id, entries in channel_pending.items():
+        clean_entries = []
+        for entry in entries:
+            if not isinstance(entry, dict) or not str(entry.get("prompt", "")).strip():
+                continue
+            clean_entries.append({
+                "prompt": str(entry["prompt"]),
+                "message_id": entry.get("message_id"),
+                "image_paths": list(entry.get("image_paths") or []),
+                "created_at": str(entry.get("created_at") or ""),
+            })
+        if clean_entries:
+            payload[str(channel_id)] = clean_entries
+    tmp_path = f"{CHANNEL_PENDING_FILE}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, CHANNEL_PENDING_FILE)
+
+
+def _queue_channel_pending(channel_id: int, prompt: str, message, image_paths: list[str]):
+    entry = {
+        "prompt": prompt,
+        "message_id": getattr(message, "id", None),
+        "message": message,
+        "image_paths": list(image_paths or []),
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    channel_pending.setdefault(channel_id, []).append(entry)
+    save_channel_pending()
+    return entry
+
+
+def _pop_channel_pending(channel_id: int) -> list[dict]:
+    entries = channel_pending.pop(channel_id, None) or []
+    save_channel_pending()
+    return entries
+
+
+def _clear_channel_pending(channel_id: int) -> bool:
+    existed = bool(channel_pending.pop(channel_id, None))
+    save_channel_pending()
+    return existed
+
+def load_codex_usage_stats() -> dict:
+    try:
+        with open(CODEX_USAGE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"version": 1, "days": {}}
+        days = data.get("days")
+        if not isinstance(days, dict):
+            days = {}
+        return {"version": 1, "days": days}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {"version": 1, "days": {}}
+
+def save_codex_usage_stats():
+    tmp_path = f"{CODEX_USAGE_FILE}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(codex_usage_stats, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, CODEX_USAGE_FILE)
+
 def save_workdirs():
     save_json_dict(WORKDIRS_FILE, channel_workdirs)
 
@@ -274,6 +388,12 @@ codex_deferred_jobs: dict[int, dict] = load_codex_deferred_jobs()
 for _job in codex_deferred_jobs.values():
     _job.pop("running", None)
     _job.pop("started_at", None)
+channel_pending.update(load_channel_pending())
+codex_usage_stats: dict = load_codex_usage_stats()
+codex_rate_limit_cache: dict = {
+    "expires_at": 0.0,
+    "state": None,
+}
 scheduler_task: asyncio.Task | None = None
 
 MODEL_ALIASES = ["opus", "sonnet", "haiku"]
@@ -285,6 +405,13 @@ SELECT_MODEL_OPTIONS = [
         "backend": "codex",
         "model": None,
         "description": "환경설정의 Codex 기본 모델",
+    },
+    {
+        "value": "claude-opus-5",
+        "label": "Claude Opus 5.0",
+        "backend": "claude",
+        "model": "claude-opus-5",
+        "description": "Claude Opus 5.0 고정",
     },
     {
         "value": "claude-opus-4-8",
@@ -334,6 +461,9 @@ SELECT_MODEL_ALIASES = {
     "highest": "codex",
     "codex-highest": "codex",
     "gpt-5.6": "gpt-5.6-sol",
+    "opus-5": "claude-opus-5",
+    "opus-5.0": "claude-opus-5",
+    "opus5": "claude-opus-5",
     "opus-4.8": "claude-opus-4-8",
     "opus-4-8": "claude-opus-4-8",
     "opus-4.7": "claude-opus-4-7",
@@ -689,6 +819,136 @@ def _codex_exec_base_args(channel_id: int) -> list[str]:
     return args
 
 
+def _codex_command(args: list[str]) -> list[str]:
+    """Windows npm shim을 포함해 Codex 관리 명령을 실행 가능한 argv로 만든다."""
+    if os.name == "nt" and CODEX_PATH.lower().endswith((".cmd", ".bat")):
+        return ["cmd.exe", "/c", CODEX_PATH] + args
+    return [CODEX_PATH] + args
+
+
+async def _run_codex_management_command(
+    args: list[str],
+    work_dir: str,
+    *,
+    timeout: float = 120.0,
+) -> tuple[int, str, str]:
+    kwargs = dict(
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=work_dir,
+    )
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    proc = await asyncio.create_subprocess_exec(*_codex_command(args), **kwargs)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        await _terminate_process_tree(proc)
+        return -1, "", f"명령 시간이 {int(timeout)}초를 초과했습니다."
+    return (
+        int(proc.returncode or 0),
+        stdout.decode("utf-8", errors="replace").strip(),
+        stderr.decode("utf-8", errors="replace").strip(),
+    )
+
+
+def format_codex_doctor_report(data: dict) -> str:
+    checks = data.get("checks") if isinstance(data, dict) else None
+    if not isinstance(checks, dict):
+        return "Codex doctor 결과 형식을 해석하지 못했습니다."
+    counts = {"ok": 0, "warning": 0, "fail": 0}
+    issues = []
+    for check_id, check in checks.items():
+        if not isinstance(check, dict):
+            continue
+        status = str(check.get("status", "unknown")).lower()
+        if status in counts:
+            counts[status] += 1
+        if status in ("warning", "fail"):
+            icon = "❌" if status == "fail" else "⚠️"
+            summary = str(check.get("summary") or "상세 없음")
+            issues.append(f"{icon} `{check_id}` — {summary}")
+    overall = str(data.get("overallStatus") or "unknown").upper()
+    version = str(data.get("codexVersion") or "unknown")
+    lines = [
+        f"🩺 **Codex Doctor** · `{overall}` · CLI `{version}`",
+        f"✅ {counts['ok']} · ⚠️ {counts['warning']} · ❌ {counts['fail']}",
+    ]
+    lines.extend(issues[:12] or ["문제가 발견되지 않았습니다."])
+    if len(issues) > 12:
+        lines.append(f"… 추가 문제 {len(issues) - 12}개")
+    return "\n".join(lines)
+
+
+async def run_codex_doctor(work_dir: str) -> tuple[bool, str]:
+    try:
+        returncode, stdout, stderr = await _run_codex_management_command(
+            ["doctor", "--json"], work_dir,
+        )
+    except FileNotFoundError:
+        return False, "Codex CLI를 찾을 수 없습니다."
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        detail = stderr or stdout or f"returncode={returncode}"
+        return False, f"Codex doctor 실행 결과를 해석하지 못했습니다:\n```\n{detail[-1500:]}\n```"
+    # doctor는 진단 항목이 fail이면 비정상 코드를 돌려줄 수 있으므로 JSON을 우선한다.
+    return True, format_codex_doctor_report(data)
+
+
+def _thread_id_from_jsonl(text: str) -> str | None:
+    for line in text.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "thread.started":
+            thread_id = event.get("thread_id")
+            if isinstance(thread_id, str) and thread_id.strip():
+                return thread_id.strip()
+    return None
+
+
+async def fork_codex_channel_session(channel_id: int, work_dir: str) -> tuple[bool, str]:
+    session_id = channel_codex_sessions.get(channel_id)
+    if not session_id:
+        return False, "현재 채널에 fork할 Codex 세션이 없습니다."
+    if channel_busy.get(channel_id):
+        return False, "현재 작업이 끝난 뒤 다시 시도해주세요."
+    args = ["exec", "fork", session_id] + _codex_exec_base_args(channel_id)
+    try:
+        returncode, stdout, stderr = await _run_codex_management_command(args, work_dir)
+    except FileNotFoundError:
+        return False, "Codex CLI를 찾을 수 없습니다."
+    new_session_id = _thread_id_from_jsonl(stdout)
+    if returncode != 0 or not new_session_id:
+        detail = stderr or stdout or f"returncode={returncode}"
+        return False, f"세션 fork 실패:\n```\n{detail[-1500:]}\n```"
+    channel_codex_sessions[channel_id] = new_session_id
+    save_codex_sessions()
+    return True, f"🌿 세션을 분기했습니다.\n이전: `{session_id}`\n현재: `{new_session_id}`"
+
+
+async def archive_codex_channel_session(channel_id: int, work_dir: str) -> tuple[bool, str]:
+    session_id = channel_codex_sessions.get(channel_id)
+    if not session_id:
+        return False, "현재 채널에 보관할 Codex 세션이 없습니다."
+    if channel_busy.get(channel_id):
+        return False, "현재 작업이 끝난 뒤 다시 시도해주세요."
+    try:
+        returncode, stdout, stderr = await _run_codex_management_command(
+            ["archive", session_id], work_dir,
+        )
+    except FileNotFoundError:
+        return False, "Codex CLI를 찾을 수 없습니다."
+    if returncode != 0:
+        detail = stderr or stdout or f"returncode={returncode}"
+        return False, f"세션 보관 실패:\n```\n{detail[-1500:]}\n```"
+    channel_codex_sessions.pop(channel_id, None)
+    save_codex_sessions()
+    return True, f"📦 세션 `{session_id}`을 보관하고 채널 연결을 해제했습니다."
+
+
 def _codex_model_options() -> list[dict]:
     """Codex CLI가 캐시한 현재 계정의 표시 가능 모델을 선택지로 변환한다."""
     data = _read_codex_models_cache()
@@ -931,6 +1191,92 @@ def _parse_codex_usage_reset_at(text: str, *, now: datetime | None = None) -> da
     return None
 
 
+def _usage_token_value(usage: dict, field: str) -> int:
+    value = usage.get(field, 0) if isinstance(usage, dict) else 0
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _usage_total_tokens(usage: dict) -> int:
+    # cached_input_tokens는 input_tokens의 부분집합이므로 중복 합산하지 않는다.
+    return _usage_token_value(usage, "input_tokens") + _usage_token_value(
+        usage, "output_tokens"
+    )
+
+
+def record_codex_channel_usage(
+    channel_id: int,
+    usage: dict,
+    *,
+    now: datetime | None = None,
+) -> dict:
+    """Codex 턴 사용량을 날짜/채널별로 누적하고 현재 채널 비중을 반환한다."""
+    now = now or datetime.now()
+    day_key = now.strftime("%Y-%m-%d")
+    days = codex_usage_stats.setdefault("days", {})
+    if not isinstance(days, dict):
+        days = {}
+        codex_usage_stats["days"] = days
+
+    day = days.setdefault(day_key, {"channels": {}})
+    if not isinstance(day, dict):
+        day = {"channels": {}}
+        days[day_key] = day
+    channels = day.setdefault("channels", {})
+    if not isinstance(channels, dict):
+        channels = {}
+        day["channels"] = channels
+
+    channel_key = str(channel_id)
+    totals = channels.setdefault(channel_key, {})
+    if not isinstance(totals, dict):
+        totals = {}
+        channels[channel_key] = totals
+    for field in CODEX_USAGE_TOKEN_FIELDS:
+        totals[field] = _usage_token_value(totals, field) + _usage_token_value(usage, field)
+    totals["turns"] = _usage_token_value(totals, "turns") + 1
+
+    cutoff = (now - timedelta(days=CODEX_USAGE_RETENTION_DAYS - 1)).date()
+    for stored_day in list(days):
+        try:
+            stored_date = datetime.strptime(stored_day, "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            del days[stored_day]
+            continue
+        if stored_date < cutoff:
+            del days[stored_day]
+
+    save_codex_usage_stats()
+
+    channel_total = _usage_total_tokens(totals)
+    all_total = sum(
+        _usage_total_tokens(channel_usage)
+        for channel_usage in channels.values()
+        if isinstance(channel_usage, dict)
+    )
+    share_percent = (channel_total / all_total * 100.0) if all_total else 0.0
+    return {
+        "date": day_key,
+        "channel": dict(totals),
+        "channel_total_tokens": channel_total,
+        "all_channels_total_tokens": all_total,
+        "share_percent": share_percent,
+    }
+
+
+def _compact_token_count(value: int) -> str:
+    value = max(0, int(value or 0))
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}".rstrip("0").rstrip(".") + "k"
+    return f"{value:,}"
+
+
 def _codex_rate_limit_state_from_result(result: dict, *, now: datetime | None = None) -> dict:
     now = now or datetime.now()
     buckets = result.get("rateLimitsByLimitId") if isinstance(result, dict) else None
@@ -939,6 +1285,7 @@ def _codex_rate_limit_state_from_result(result: dict, *, now: datetime | None = 
         buckets = {"codex": single} if isinstance(single, dict) else {}
 
     blocked: list[dict] = []
+    normalized_windows: list[dict] = []
     for limit_id, bucket in buckets.items():
         if not isinstance(bucket, dict):
             continue
@@ -951,6 +1298,20 @@ def _codex_rate_limit_state_from_result(result: dict, *, now: datetime | None = 
             used = window.get("usedPercent")
             reset_ts = window.get("resetsAt")
             windows.append({"name": window_name, "used": used, "reset_ts": reset_ts})
+            if isinstance(used, (int, float)):
+                normalized_windows.append({
+                    "limit_id": str(limit_id),
+                    "limit_name": bucket.get("limitName"),
+                    "window_name": window_name,
+                    "used_percent": float(used),
+                    "remaining_percent": max(0.0, 100.0 - float(used)),
+                    "window_duration_mins": window.get("windowDurationMins"),
+                    "resets_at": (
+                        datetime.fromtimestamp(float(reset_ts))
+                        if isinstance(reset_ts, (int, float))
+                        else None
+                    ),
+                })
 
         selected = []
         if reached_type in ("primary", "secondary"):
@@ -983,9 +1344,15 @@ def _codex_rate_limit_state_from_result(result: dict, *, now: datetime | None = 
         })
 
     if not blocked:
-        return {"blocked": False, "retry_at": None, "limit_id": None, "reached_type": None}
+        return {
+            "blocked": False,
+            "retry_at": None,
+            "limit_id": None,
+            "reached_type": None,
+            "windows": normalized_windows,
+        }
     latest = max(blocked, key=lambda item: item["retry_at"])
-    return {"blocked": True, **latest}
+    return {"blocked": True, **latest, "windows": normalized_windows}
 
 
 async def _read_codex_rate_limit_state() -> dict | None:
@@ -1065,6 +1432,117 @@ async def _read_codex_rate_limit_state() -> dict | None:
                 await asyncio.wait_for(proc.wait(), timeout=2)
             except Exception:
                 pass
+
+
+async def _read_cached_codex_rate_limit_state() -> dict | None:
+    """완료 메시지 표시용 계정 한도를 캐시해 App Server 조회를 줄인다."""
+    now = time.monotonic()
+    if now < float(codex_rate_limit_cache.get("expires_at", 0.0)):
+        return codex_rate_limit_cache.get("state")
+
+    state = await _read_codex_rate_limit_state()
+    ttl = (
+        CODEX_RATE_LIMIT_CACHE_SECONDS
+        if state is not None
+        else CODEX_RATE_LIMIT_FAILURE_CACHE_SECONDS
+    )
+    codex_rate_limit_cache["state"] = state
+    codex_rate_limit_cache["expires_at"] = now + ttl
+    return state
+
+
+def _format_limit_duration(minutes) -> str:
+    if not isinstance(minutes, (int, float)) or minutes <= 0:
+        return "한도"
+    minutes = int(minutes)
+    if minutes % (7 * 24 * 60) == 0:
+        return f"{minutes // (7 * 24 * 60)}주"
+    if minutes % (24 * 60) == 0:
+        return f"{minutes // (24 * 60)}일"
+    if minutes % 60 == 0:
+        return f"{minutes // 60}시간"
+    return f"{minutes}분"
+
+
+def _format_remaining_percent(value) -> str:
+    if not isinstance(value, (int, float)):
+        return "?"
+    if float(value).is_integer():
+        return str(int(value))
+    return f"{float(value):.1f}".rstrip("0").rstrip(".")
+
+
+def _format_limit_reset(value, *, now: datetime | None = None) -> str:
+    if not isinstance(value, datetime):
+        return "초기화 미상"
+    now = now or datetime.now()
+    if value.date() == now.date():
+        return value.strftime("%H:%M")
+    return value.strftime("%m/%d %H:%M")
+
+
+def _format_codex_rate_limit_line(state: dict | None, *, now: datetime | None = None) -> str | None:
+    windows = state.get("windows") if isinstance(state, dict) else None
+    if not isinstance(windows, list) or not windows:
+        return None
+
+    preferred = [
+        window for window in windows
+        if isinstance(window, dict) and window.get("limit_id") == "codex"
+    ]
+    selected = preferred or [window for window in windows if isinstance(window, dict)]
+    selected = sorted(
+        selected,
+        key=lambda window: (
+            window.get("window_duration_mins")
+            if isinstance(window.get("window_duration_mins"), (int, float))
+            else float("inf")
+        ),
+    )[:2]
+
+    parts = []
+    for window in selected:
+        duration = _format_limit_duration(window.get("window_duration_mins"))
+        remaining = _format_remaining_percent(window.get("remaining_percent"))
+        reset = _format_limit_reset(window.get("resets_at"), now=now)
+        parts.append(f"{duration} {remaining}% 남음({reset})")
+    return "⏳ 한도: " + " · ".join(parts) if parts else None
+
+
+def format_codex_usage_message(
+    usage: dict,
+    channel_daily: dict | None,
+    rate_limit_state: dict | None,
+    *,
+    now: datetime | None = None,
+) -> str:
+    input_tokens = _usage_token_value(usage, "input_tokens")
+    cached_tokens = _usage_token_value(usage, "cached_input_tokens")
+    output_tokens = _usage_token_value(usage, "output_tokens")
+    reasoning_tokens = _usage_token_value(usage, "reasoning_output_tokens")
+
+    turn_parts = [
+        f"입력 {_compact_token_count(input_tokens)}",
+        f"캐시 {_compact_token_count(cached_tokens)}",
+        f"출력 {_compact_token_count(output_tokens)}",
+    ]
+    if reasoning_tokens:
+        turn_parts.append(f"추론 {_compact_token_count(reasoning_tokens)}")
+    lines = ["📊 이번: " + " · ".join(turn_parts)]
+
+    if isinstance(channel_daily, dict):
+        channel_total = _compact_token_count(channel_daily.get("channel_total_tokens", 0))
+        share = float(channel_daily.get("share_percent", 0.0) or 0.0)
+        share_text = f"{share:.1f}".rstrip("0").rstrip(".")
+        turns = _usage_token_value(channel_daily.get("channel", {}), "turns")
+        lines.append(
+            f"📈 이 채널 오늘: {channel_total} · 전체 {share_text}% · {turns}회"
+        )
+
+    limit_line = _format_codex_rate_limit_line(rate_limit_state, now=now)
+    if limit_line:
+        lines.append(limit_line)
+    return "\n".join(lines)
 
 
 async def _resolve_codex_usage_retry_at(error_text: str) -> datetime:
@@ -1219,8 +1697,16 @@ def extract_image_paths_from_text(text: str, work_dir: str) -> list[str]:
 
     ext_pattern = r"(?:png|jpg|jpeg|gif|webp|bmp)"
     patterns = [
+        # Markdown 로컬 파일 링크: [미리보기](C:/.../result.png)
+        rf"\]\(\s*<?([^<>\r\n)]+?\.{ext_pattern})>?(?:#[^)]*)?\s*\)",
+        # 코드 표시된 절대/상대 경로 및 파일명: `codex_screenshots/result.png`
+        rf"`([^`\r\n]+?\.{ext_pattern})`",
         rf"<([^<>]+?\.{ext_pattern})>",
         rf"((?:[A-Za-z]:[\\/]|/Users/|~/|\.\.?[\\/])[^`'\"<>\s)]+?\.{ext_pattern})",
+        # 작업 폴더 기준 상대 경로: codex_screenshots/result.png
+        rf"((?:[A-Za-z0-9_.-]+[\\/])+[^`'\"<>\s)]+?\.{ext_pattern})",
+        # 작업 폴더 바로 아래의 단순 파일명: result.png
+        rf"(?<![A-Za-z0-9_.\\/-])([A-Za-z0-9_.-]+\.{ext_pattern})(?![A-Za-z0-9_.-])",
     ]
     found: list[str] = []
     seen: set[str] = set()
@@ -1303,14 +1789,26 @@ async def send_files_to_channel(channel, paths: list[str], *, title: str = "📎
 
 
 async def send_screenshot_outputs_if_requested(channel, prompt: str, work_dir: str, since_ts: float, result_text: str = ""):
-    if not wants_screenshot_attachment(prompt):
+    requested = wants_screenshot_attachment(prompt)
+    reported_images = extract_image_paths_from_text(result_text, work_dir)
+
+    # 사용자가 이미지 첨부를 명시하지 않았더라도 최종 답변이 실제 이미지
+    # 파일을 보고하면 Discord에 전달한다. 단순한 "PNG 형식" 언급은
+    # extract_image_paths_from_text()의 파일 존재 검사에서 제외된다.
+    if not requested and not reported_images:
         return
+
+    candidates = list(reported_images)
+    if requested:
+        candidates.extend(collect_recent_images(work_dir, since_ts))
+
     images = []
-    for path in extract_image_paths_from_text(result_text, work_dir) + collect_recent_images(work_dir, since_ts):
+    for path in candidates:
         if path not in images:
             images.append(path)
     if not images:
-        await channel.send("📷 새로 생성된 스크린샷 파일을 찾지 못했습니다.")
+        if requested:
+            await channel.send("📷 새로 생성된 스크린샷 파일을 찾지 못했습니다.")
         return
     await send_files_to_channel(channel, images, title="📷 스크린샷")
 
@@ -1357,6 +1855,25 @@ def split_message(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
         chunks.append(text[:split_at])
         text = text[split_at:].lstrip("\n")
     return chunks
+
+
+async def send_codex_result_to_channel(
+    channel,
+    result_text: str,
+    reply_to: discord.Message | None = None,
+):
+    """Codex 최종 답변을 Discord Markdown으로 전송한다."""
+    for i, chunk in enumerate(split_message(result_text)):
+        if not chunk:
+            continue
+        send_kwargs = {
+            # 코드블록 외부로 출력하더라도 답변 속 문자열이 실제 멘션을
+            # 발생시키지 않도록 한다.
+            "allowed_mentions": discord.AllowedMentions.none(),
+        }
+        if reply_to and i == 0:
+            send_kwargs["reference"] = reply_to
+        await channel.send(chunk, **send_kwargs)
 
 
 def create_bot() -> commands.Bot:
@@ -1538,6 +2055,15 @@ async def _terminate_process_tree(proc, *, timeout: float = 8.0):
         return
 
     if os.name == "nt":
+        # CREATE_NEW_PROCESS_GROUP로 시작한 Codex에는 먼저 Ctrl+Break를 보내
+        # 정상 정리 기회를 준다. 지원하지 않거나 응답하지 않으면 기존의
+        # taskkill /T /F로 확실하게 프로세스 트리를 정리한다.
+        try:
+            proc.send_signal(signal.CTRL_BREAK_EVENT)
+            await asyncio.wait_for(proc.wait(), timeout=min(1.5, timeout))
+            return
+        except (AttributeError, asyncio.TimeoutError, ProcessLookupError, OSError):
+            pass
         # Codex가 cmd -> node -> codex.exe -> MCP 순으로 자식을 만들기 때문에
         # proc.kill()만으로는 실제 작업이 고아 프로세스로 남는다.
         try:
@@ -1736,7 +2262,9 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
         cwd=work_dir,
     )
     if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        kwargs["creationflags"] = (
+            subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
 
     try:
         proc = await asyncio.create_subprocess_exec(*cmd, limit=1024*1024, **kwargs)
@@ -2105,29 +2633,38 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
     if not result_text:
         return "(빈 응답)"
 
+    channel_daily_usage = None
+    if usage_info and channel_id:
+        try:
+            channel_daily_usage = record_codex_channel_usage(channel_id, usage_info)
+        except Exception as e:
+            logger.warning(f"채널 {channel_id}: Codex 사용량 누적 저장 실패: {e}")
+
     if status_channel:
-        chunks = split_message(result_text)
-        for i, chunk in enumerate(chunks):
-            content = f"```\n{chunk}\n```"
-            try:
-                send_kwargs = {}
-                if reply_to and i == 0:
-                    send_kwargs["reference"] = reply_to
-                await status_channel.send(content, **send_kwargs)
-            except Exception:
-                pass
-        # usage 정보 표시
+        try:
+            await send_codex_result_to_channel(
+                status_channel,
+                result_text,
+                reply_to=reply_to,
+            )
+        except Exception:
+            pass
+        # 이미 완료 이벤트에 포함된 턴 사용량과 5분 캐시한 계정 한도를
+        # 기존 통계 메시지 하나로 함께 표시한다.
         if usage_info:
-            stats = []
-            it = usage_info.get("input_tokens")
-            ot = usage_info.get("output_tokens")
-            if it or ot:
-                stats.append(f"📊 {it:,}→{ot:,} tok")
-            if stats:
-                try:
-                    await status_channel.send(" ".join(stats))
-                except Exception:
-                    pass
+            try:
+                rate_limit_state = await _read_cached_codex_rate_limit_state()
+                stats = format_codex_usage_message(
+                    usage_info,
+                    channel_daily_usage,
+                    rate_limit_state,
+                )
+                await status_channel.send(
+                    stats,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except Exception as e:
+                logger.warning(f"채널 {channel_id}: Codex 사용량 표시 실패: {e}")
 
     return result_text
 
@@ -2619,6 +3156,47 @@ def _scan_command_dir(cmd_dir: str) -> list[dict]:
     return out
 
 
+def _scan_plugin_cache(cache_root: str, engine: str) -> list[tuple[list[dict], str, str]]:
+    """플러그인 캐시 구조가 바뀌어도 모든 최상위 skills/commands를 찾는다."""
+    if not os.path.isdir(cache_root):
+        return []
+    found: list[tuple[list[dict], str, str]] = []
+    seen_roots: set[str] = set()
+    try:
+        candidates = sorted(
+            glob.glob(os.path.join(cache_root, "**", "skills"), recursive=True),
+            reverse=True,
+        )
+        for skills_dir in candidates:
+            normalized = os.path.normcase(os.path.normpath(skills_dir))
+            if normalized in seen_roots or not os.path.isdir(skills_dir):
+                continue
+            seen_roots.add(normalized)
+            version_dir = os.path.dirname(skills_dir)
+            plugin = os.path.basename(os.path.dirname(version_dir))
+            items = _scan_skill_dir(skills_dir)
+            if items and plugin:
+                found.append((items, f"plugin:{plugin}", engine))
+
+        command_candidates = sorted(
+            glob.glob(os.path.join(cache_root, "**", "commands"), recursive=True),
+            reverse=True,
+        )
+        for commands_dir in command_candidates:
+            normalized = os.path.normcase(os.path.normpath(commands_dir))
+            if normalized in seen_roots or not os.path.isdir(commands_dir):
+                continue
+            seen_roots.add(normalized)
+            version_dir = os.path.dirname(commands_dir)
+            plugin = os.path.basename(os.path.dirname(version_dir))
+            items = _scan_command_dir(commands_dir)
+            if items and plugin:
+                found.append((items, f"plugin:{plugin}", engine))
+    except Exception as e:
+        logger.warning(f"플러그인 캐시 스캔 실패 {cache_root}: {e}")
+    return found
+
+
 BUILTIN_SLASH_COMMANDS = [
     ("init", "새 CLAUDE.md 생성 (코드베이스 문서화)"),
     ("review", "PR 리뷰"),
@@ -2695,33 +3273,13 @@ def scan_all_skills(work_dir: str | None = None) -> list[dict]:
         "claude",
     )
 
-    plugins_cache = os.path.expanduser("~/.claude/plugins/cache")
-    if os.path.isdir(plugins_cache):
-        try:
-            for marketplace in os.listdir(plugins_cache):
-                mp_path = os.path.join(plugins_cache, marketplace)
-                if not os.path.isdir(mp_path):
-                    continue
-                for plugin in os.listdir(mp_path):
-                    pl_path = os.path.join(mp_path, plugin)
-                    if not os.path.isdir(pl_path):
-                        continue
-                    for version in os.listdir(pl_path):
-                        version_dir = os.path.join(pl_path, version)
-                        add_items(
-                            _scan_skill_dir(os.path.join(version_dir, "skills")),
-                            f"plugin:{plugin}",
-                            "claude",
-                            prefix=f"{plugin}:",
-                        )
-                        add_items(
-                            _scan_command_dir(os.path.join(version_dir, "commands")),
-                            f"plugin:{plugin}",
-                            "claude",
-                            prefix=f"{plugin}:",
-                        )
-        except Exception as e:
-            logger.warning(f"플러그인 스킬 스캔 실패: {e}")
+    for cache_root, engine in (
+        (os.path.expanduser("~/.codex/plugins/cache"), "codex"),
+        (os.path.expanduser("~/.claude/plugins/cache"), "claude"),
+    ):
+        for items, source, item_engine in _scan_plugin_cache(cache_root, engine):
+            plugin = source.split(":", 1)[1]
+            add_items(items, source, item_engine, prefix=f"{plugin}:")
 
     for name, desc in BUILTIN_SLASH_COMMANDS:
         if name.casefold() in seen:
@@ -2747,10 +3305,7 @@ SKILL_SOURCE_ORDER = {
 
 
 def _skill_autocomplete_choices(work_dir: str, current: str = "") -> list[app_commands.Choice]:
-    skills = [
-        skill for skill in scan_all_skills(work_dir)
-        if skill["source"].casefold() != "plugin:codex"
-    ]
+    skills = scan_all_skills(work_dir)
     query = current.casefold().strip()
     if query:
         skills = [
@@ -3169,11 +3724,13 @@ async def _run_deferred_codex_job(bot: commands.Bot, channel_id: int):
             save_codex_deferred_jobs()
         else:
             # 자동 재개 완료 메시지를 보내는 짧은 사이에 들어온 일반 요청도 놓치지 않는다.
-            pending_list = channel_pending.pop(channel_id, None) or []
+            pending_list = _pop_channel_pending(channel_id)
             if pending_list:
-                prompts = [item[0] for item in pending_list]
-                images = [path for item in pending_list for path in item[2]]
-                pending_message = pending_list[-1][1]
+                prompts = [item["prompt"] for item in pending_list]
+                images = [path for item in pending_list for path in item.get("image_paths", [])]
+                pending_message = pending_list[-1].get("message")
+                if pending_message is None:
+                    pending_message = await channel.send("▶ 재시작 전 대기 요청을 이어서 처리합니다.")
                 channel_busy[channel_id] = True
                 task = asyncio.create_task(_process_channel(
                     channel_id,
@@ -3242,9 +3799,13 @@ async def _process_channel(ch_id: int, prompt: str, message: discord.Message, im
                     pass
 
             if quota_parked:
-                pending_list = channel_pending.pop(ch_id, None) or []
-                for p_prompt, _p_msg, p_images in pending_list:
-                    _append_deferred_request(ch_id, p_prompt, p_images)
+                pending_list = _pop_channel_pending(ch_id)
+                for item in pending_list:
+                    _append_deferred_request(
+                        ch_id,
+                        item["prompt"],
+                        item.get("image_paths", []),
+                    )
                 if pending_list:
                     try:
                         await message.channel.send(
@@ -3255,15 +3816,18 @@ async def _process_channel(ch_id: int, prompt: str, message: discord.Message, im
                 break
 
             # 대기 중인 메시지들을 합쳐서 처리
-            pending_list = channel_pending.pop(ch_id, None)
+            pending_list = _pop_channel_pending(ch_id)
             if pending_list:
                 # 모든 대기 메시지의 프롬프트를 합치고, 마지막 메시지 객체로 응답
                 all_prompts = []
                 all_images = []
-                for p_prompt, p_msg, p_images in pending_list:
-                    all_prompts.append(p_prompt)
-                    all_images.extend(p_images)
-                message = pending_list[-1][1]  # 마지막 메시지에 답장
+                for item in pending_list:
+                    all_prompts.append(item["prompt"])
+                    all_images.extend(item.get("image_paths", []))
+                next_message = pending_list[-1].get("message")
+                if next_message is None:
+                    next_message = await message.channel.send("▶ 재시작 전 대기 요청을 이어서 처리합니다.")
+                message = next_message  # 마지막 메시지에 답장
                 prompt = "\n\n".join(all_prompts)
                 image_paths = all_images
                 logger.info(f"채널 {ch_id}: 대기 중이던 메시지 {len(pending_list)}개 합쳐서 처리")
@@ -3390,6 +3954,55 @@ async def _run_scheduled_job(bot: commands.Bot, job_id: str, job: dict):
         channel_status.pop(ch_id, None)
 
 
+async def _resume_persisted_channel_pending(bot: commands.Bot):
+    """봇 재시작으로 실행 태스크가 사라진 일반 대기 요청을 채널별로 재개한다."""
+    for channel_id, entries in list(channel_pending.items()):
+        if not entries or channel_busy.get(channel_id) or channel_id in codex_deferred_jobs:
+            continue
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except Exception as e:
+                logger.warning(f"채널 {channel_id}: 저장된 대기열 채널 조회 실패: {e}")
+                continue
+
+        restored = _pop_channel_pending(channel_id)
+        if not restored:
+            continue
+        message = None
+        message_id = restored[-1].get("message_id")
+        if message_id and hasattr(channel, "fetch_message"):
+            try:
+                message = await channel.fetch_message(int(message_id))
+            except Exception:
+                message = None
+        if message is None:
+            try:
+                message = await channel.send("▶ 봇 재시작 전 대기 요청을 이어서 처리합니다.")
+            except Exception as e:
+                logger.warning(f"채널 {channel_id}: 저장된 대기열 안내 실패: {e}")
+                channel_pending[channel_id] = restored
+                save_channel_pending()
+                continue
+
+        prompts = [entry["prompt"] for entry in restored]
+        images = [
+            path
+            for entry in restored
+            for path in entry.get("image_paths", [])
+        ]
+        channel_busy[channel_id] = True
+        task = asyncio.create_task(_process_channel(
+            channel_id,
+            "\n\n".join(prompts),
+            message,
+            images,
+        ))
+        channel_tasks[channel_id] = task
+        logger.info(f"채널 {channel_id}: 재시작 전 대기 요청 {len(restored)}개 복구")
+
+
 async def _scheduler_loop(bot: commands.Bot):
     await bot.wait_until_ready()
     logger.info("예약 작업 + Codex 자동 재개 스케줄러 시작")
@@ -3441,8 +4054,8 @@ async def _scheduler_loop(bot: commands.Bot):
 
 async def _stop_channel_execution(channel_id: int) -> bool:
     """현재 실행과 자동 재개를 멈추되 Claude/Codex 대화 세션 ID는 유지한다."""
-    channel_pending.pop(channel_id, None)
-    had_work = _cancel_deferred_codex_job(channel_id)
+    had_work = _clear_channel_pending(channel_id)
+    had_work = _cancel_deferred_codex_job(channel_id) or had_work
 
     task = channel_tasks.get(channel_id)
     if task and not task.done():
@@ -3519,7 +4132,7 @@ async def _handle_message(message: discord.Message, bot: commands.Bot):
 
         # 현재 작업 중이면 조용히 대기 큐에 추가 (CLI처럼 자연스럽게)
         if channel_busy.get(ch_id):
-            channel_pending.setdefault(ch_id, []).append((prompt, message, image_paths))
+            _queue_channel_pending(ch_id, prompt, message, image_paths)
             return
 
         # 작업 시작
@@ -3556,6 +4169,7 @@ def _register_events(bot: commands.Bot):
         asyncio.create_task(_attachment_cleanup_loop())
         if scheduler_task is None or scheduler_task.done():
             scheduler_task = asyncio.create_task(_scheduler_loop(bot))
+        asyncio.create_task(_resume_persisted_channel_pending(bot))
 
         # 비정상 종료 후 재시작 감지 → 알림
         is_restart = os.path.exists(_RESTART_FLAG_FILE)
@@ -3775,6 +4389,41 @@ def _register_events(bot: commands.Bot):
         ok, message = apply_selected_reasoning(ch_id, level)
         await ctx.reply(message)
 
+    @bot.command(name="doctor")
+    async def codex_doctor_cmd(ctx: commands.Context):
+        """!doctor — 현재 채널 작업 폴더 기준 Codex 설치/인증/런타임 진단."""
+        if ctx.author.id != ALLOWED_USER_ID:
+            return
+        work_dir = channel_workdirs.get(ctx.channel.id, WORKING_DIR)
+        status = await ctx.reply("🩺 Codex 진단 중...")
+        _ok, report = await run_codex_doctor(work_dir)
+        await status.edit(content=report[:1900])
+
+    @bot.command(name="session")
+    async def codex_session_cmd(ctx: commands.Context, action: str = "status"):
+        """!session status|fork|archive — 채널 Codex 세션 관리."""
+        if ctx.author.id != ALLOWED_USER_ID:
+            return
+        ch_id = ctx.channel.id
+        work_dir = channel_workdirs.get(ch_id, WORKING_DIR)
+        action = action.strip().lower()
+        if action in ("status", "show", "상태"):
+            session_id = channel_codex_sessions.get(ch_id)
+            await ctx.reply(
+                f"🧵 현재 Codex 세션: `{session_id}`"
+                if session_id else "현재 채널에 연결된 Codex 세션이 없습니다."
+            )
+            return
+        if action in ("fork", "분기"):
+            _ok, result = await fork_codex_channel_session(ch_id, work_dir)
+            await ctx.reply(result)
+            return
+        if action in ("archive", "보관"):
+            _ok, result = await archive_codex_channel_session(ch_id, work_dir)
+            await ctx.reply(result)
+            return
+        await ctx.reply("사용법: `!session status|fork|archive`")
+
     def _find_text_channel(ctx: commands.Context, name: str) -> discord.TextChannel | None:
         raw = name.strip()
         if not raw:
@@ -3884,32 +4533,44 @@ def _register_events(bot: commands.Bot):
 
     @bot.command(name="skill")
     async def manage_skill(ctx: commands.Context, action: str = "list", *, name: str = ""):
-        """!skill list|create|delete|show <이름> — .claude/skills/ 관리. 파일 첨부로 SKILL.md 생성."""
+        """!skill list|create|delete|show <이름> — 현재 백엔드의 스킬 관리."""
         if ctx.author.id != ALLOWED_USER_ID:
             await ctx.reply("권한이 없습니다.")
             return
 
         work_dir = channel_workdirs.get(ctx.channel.id, WORKING_DIR)
-        skills_dir = os.path.join(work_dir, ".claude", "skills")
+        backend = channel_backends.get(ctx.channel.id, DEFAULT_BACKEND)
+        skills_dir = os.path.join(
+            work_dir,
+            ".agents" if backend == "codex" else ".claude",
+            "skills",
+        )
 
         if action == "list":
-            if not os.path.isdir(skills_dir):
+            all_skills = scan_all_skills(work_dir)
+            if not all_skills:
                 await ctx.reply("스킬이 없습니다.")
                 return
-            skill_names = [d for d in os.listdir(skills_dir)
-                          if os.path.isdir(os.path.join(skills_dir, d))]
-            if not skill_names:
-                await ctx.reply("스킬이 없습니다.")
-                return
-            listing = "\n".join(f"• `{s}`" for s in sorted(skill_names))
-            await ctx.reply(f"**스킬 목록:**\n{listing}")
+            listing = "\n".join(
+                f"• `{skill['name']}` · {skill['source']}"
+                for skill in sorted(all_skills, key=lambda item: item["name"].casefold())
+            )
+            for i, chunk in enumerate(split_message(listing, limit=1750)):
+                prefix = "**통합 스킬 목록:**\n" if i == 0 else ""
+                await ctx.reply(prefix + chunk)
 
         elif action == "show":
             if not name:
                 await ctx.reply("사용법: `!skill show <이름>`")
                 return
-            skill_file = os.path.join(skills_dir, name, "SKILL.md")
-            if not os.path.isfile(skill_file):
+            query = name.strip().casefold()
+            match = next(
+                (skill for skill in scan_all_skills(work_dir)
+                 if skill["name"].casefold() == query and skill.get("path")),
+                None,
+            )
+            skill_file = match.get("path") if match else None
+            if not skill_file or not os.path.isfile(skill_file):
                 await ctx.reply(f"스킬 `{name}`을(를) 찾을 수 없습니다.")
                 return
             with open(skill_file, "r", encoding="utf-8") as f:
@@ -3933,7 +4594,7 @@ def _register_events(bot: commands.Bot):
             os.makedirs(skill_path, exist_ok=True)
             with open(os.path.join(skill_path, "SKILL.md"), "w", encoding="utf-8") as f:
                 f.write(content)
-            await ctx.reply(f"스킬 `{name}` 생성 완료: `{skill_path}`")
+            await ctx.reply(f"{backend} 스킬 `{name}` 생성 완료: `{skill_path}`")
 
         elif action == "delete":
             if not name:
@@ -3967,7 +4628,7 @@ def _register_events(bot: commands.Bot):
             )
             return
         if channel_busy.get(ch_id):
-            channel_pending.setdefault(ch_id, []).append((prompt, sent_msg, []))
+            _queue_channel_pending(ch_id, prompt, sent_msg, [])
             return
 
         channel_busy[ch_id] = True
@@ -4009,6 +4670,44 @@ def _register_events(bot: commands.Bot):
             f"📁 `{work_dir}`\n🤖 model: `{model}`\n"
             f"🧠 backend: `{backend}`\n💭 reasoning: `{reasoning}`", ephemeral=True
         )
+
+    @bot.tree.command(name="doctor", description="Codex 설치·인증·런타임 진단")
+    async def slash_doctor(interaction: discord.Interaction):
+        if interaction.user.id != ALLOWED_USER_ID:
+            await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        work_dir = channel_workdirs.get(interaction.channel.id, WORKING_DIR)
+        _ok, report = await run_codex_doctor(work_dir)
+        await interaction.followup.send(report[:1900], ephemeral=True)
+
+    @bot.tree.command(name="session", description="현재 채널 Codex 세션 관리")
+    @app_commands.describe(action="상태 확인, 분기 또는 보관")
+    @app_commands.choices(action=[
+        app_commands.Choice(name="상태 확인", value="status"),
+        app_commands.Choice(name="새 세션으로 분기", value="fork"),
+        app_commands.Choice(name="세션 보관", value="archive"),
+    ])
+    async def slash_session(interaction: discord.Interaction, action: str):
+        if interaction.user.id != ALLOWED_USER_ID:
+            await interaction.response.send_message("권한이 없습니다.", ephemeral=True)
+            return
+        ch_id = interaction.channel.id
+        work_dir = channel_workdirs.get(ch_id, WORKING_DIR)
+        if action == "status":
+            session_id = channel_codex_sessions.get(ch_id)
+            result = (
+                f"🧵 현재 Codex 세션: `{session_id}`"
+                if session_id else "현재 채널에 연결된 Codex 세션이 없습니다."
+            )
+            await interaction.response.send_message(result, ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        if action == "fork":
+            _ok, result = await fork_codex_channel_session(ch_id, work_dir)
+        else:
+            _ok, result = await archive_codex_channel_session(ch_id, work_dir)
+        await interaction.followup.send(result[:1900], ephemeral=True)
 
     @bot.tree.command(name="backend", description="채널 백엔드 변경 (claude / codex)")
     @app_commands.describe(name="claude 또는 codex")
