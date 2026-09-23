@@ -51,6 +51,34 @@ class CodexDoctorTests(unittest.TestCase):
         self.assertEqual(bot._thread_id_from_jsonl(output), "thread-new")
 
 
+class CodexModelSelectionTests(unittest.TestCase):
+    def test_fallback_default_is_gpt_6_sol(self):
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(bot, "_read_codex_config", return_value={}),
+        ):
+            self.assertEqual(bot._resolve_codex_model(), "gpt-6-sol")
+
+    def test_default_model_is_selectable_before_cache_refresh(self):
+        cache = {
+            "models": [{
+                "slug": "gpt-6-astra",
+                "display_name": "GPT-6 Astra",
+                "description": "Frontier model",
+                "visibility": "list",
+                "priority": 1,
+            }]
+        }
+        with (
+            patch.object(bot, "_read_codex_models_cache", return_value=cache),
+            patch.object(bot, "_resolve_codex_model", return_value="gpt-6-sol"),
+        ):
+            values = [option["value"] for option in bot._codex_model_options()]
+
+        self.assertEqual(values[0], "gpt-6-sol")
+        self.assertIn("gpt-6-astra", values)
+
+
 class PendingQueuePersistenceTests(unittest.TestCase):
     def setUp(self):
         self.original_pending = bot.channel_pending

@@ -460,6 +460,7 @@ SELECT_MODEL_ALIASES = {
     "default": "codex",
     "highest": "codex",
     "codex-highest": "codex",
+    "gpt-6": "gpt-6-sol",
     "gpt-5.6": "gpt-5.6-sol",
     "opus-5": "claude-opus-5",
     "opus-5.0": "claude-opus-5",
@@ -635,7 +636,7 @@ def _unavailable_local_mcp_overrides(config: dict | None = None) -> list[str]:
 
 
 def _resolve_codex_model(channel_id: int | None = None) -> str | None:
-    """Codex 모델 — 채널 선택 > .env > config.toml > gpt-5.6-sol.
+    """Codex 모델 — 채널 선택 > .env > config.toml > gpt-6-sol.
 
     전역 config는 플러그인 로드를 위해 사용하되, 채널별 선택이 항상 우선하도록
     여기서 모델 값을 정해 -m 플래그로 전달한다.
@@ -650,7 +651,7 @@ def _resolve_codex_model(channel_id: int | None = None) -> str | None:
     model = _read_codex_config().get("model")
     if isinstance(model, str) and model.strip():
         return model.strip()
-    return "gpt-5.6-sol"
+    return "gpt-6-sol"
 
 
 REASONING_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
@@ -982,22 +983,21 @@ def _codex_model_options() -> list[dict]:
             "priority": item.get("priority", 9999),
         })
 
+    fallback = _resolve_codex_model()
+    if fallback and fallback.lower() not in seen:
+        options.append({
+            "value": fallback,
+            "label": fallback,
+            "backend": "codex",
+            "model": fallback,
+            "description": "현재 Codex 기본 모델",
+            "priority": 0,
+        })
+
     options.sort(key=lambda option: (
         option["priority"] if isinstance(option["priority"], int) else 9999,
         option["label"].lower(),
     ))
-
-    if not options:
-        fallback = _resolve_codex_model()
-        if fallback:
-            options.append({
-                "value": fallback,
-                "label": fallback,
-                "backend": "codex",
-                "model": fallback,
-                "description": "현재 Codex 기본 모델 (캐시 목록 없음)",
-                "priority": 0,
-            })
     return options
 
 
