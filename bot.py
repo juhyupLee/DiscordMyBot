@@ -1708,17 +1708,23 @@ def _store_claude_rate_limits(entries: dict) -> bool:
     return changed
 
 
-def _format_usage_percent(used: float) -> str:
-    text = f"{int(round(used))}%"
-    return f"⚠️{text}" if used >= USAGE_WARN_PERCENT else text
+def _format_usage_part(name: str, used_values: list[float]) -> str:
+    """'Claude 18/13%' 형태. 창은 짧은 것부터, 하나라도 경고 수준이면 이름 앞에 ⚠️."""
+    if not used_values:
+        return f"{name} -"
+    warn = "⚠️" if max(used_values) >= USAGE_WARN_PERCENT else ""
+    return f"{warn}{name} {'/'.join(str(int(round(v))) for v in used_values)}%"
 
 
 def _format_usage_presence(claude_limits: dict, codex_state: dict | None, *, now: float | None = None) -> str:
-    """봇 상태 문구용 한 줄 사용량. 초기화 시각이 지난 창은 0%로 본다."""
+    """봇 상태 문구용 한 줄 사용량. 멤버 목록에서 잘리지 않게 짧게 쓴다.
+
+    예: 'Claude 18/13% · ⚠️Codex 94%' (Claude는 5시간/주간 순). 초기화 시각이 지난 창은 0%로 본다.
+    """
     now = time.time() if now is None else now
 
-    claude_parts = []
-    for key, minutes in CLAUDE_RATE_LIMIT_WINDOWS.items():
+    claude_used = []
+    for key in CLAUDE_RATE_LIMIT_WINDOWS:
         entry = claude_limits.get(key)
         used = entry.get("used_percent") if isinstance(entry, dict) else None
         if not isinstance(used, (int, float)):
@@ -1726,9 +1732,9 @@ def _format_usage_presence(claude_limits: dict, codex_state: dict | None, *, now
         resets_at = entry.get("resets_at")
         if isinstance(resets_at, (int, float)) and resets_at <= now:
             used = 0
-        claude_parts.append(f"{_format_limit_duration(minutes)} {_format_usage_percent(used)}")
+        claude_used.append(used)
 
-    codex_parts = []
+    codex_used = []
     for window in _select_codex_limit_windows(codex_state):
         used = window.get("used_percent")
         if not isinstance(used, (int, float)):
@@ -1739,12 +1745,9 @@ def _format_usage_presence(claude_limits: dict, codex_state: dict | None, *, now
         resets_at = window.get("resets_at")
         if isinstance(resets_at, datetime) and resets_at.timestamp() <= now:
             used = 0
-        codex_parts.append(f"{_format_limit_duration(window.get('window_duration_mins'))} {_format_usage_percent(used)}")
+        codex_used.append(used)
 
-    text = (
-        f"Claude {' · '.join(claude_parts) or '-'}"
-        f" | Codex {' · '.join(codex_parts) or '-'}"
-    )
+    text = f"{_format_usage_part('Claude', claude_used)} · {_format_usage_part('Codex', codex_used)}"
     return text[:128]
 
 

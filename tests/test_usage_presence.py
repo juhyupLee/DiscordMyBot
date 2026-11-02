@@ -65,18 +65,27 @@ class UsagePresenceTests(unittest.IsolatedAsyncioTestCase):
 
         text = bot._format_usage_presence(bot.claude_rate_limits, CODEX_STATE, now=NOW)
 
-        self.assertEqual(text, "Claude 5시간 31% · 1주 10% | Codex 1주 ⚠️94%")
-        self.assertLessEqual(len(text), 128)
+        self.assertEqual(text, "Claude 31/10% · ⚠️Codex 94%")
+        # 멤버 목록에서 잘리지 않을 만큼 짧게
+        self.assertLessEqual(len(text), 28)
 
     def test_unknown_values_show_dash(self):
-        self.assertEqual(bot._format_usage_presence({}, None, now=NOW), "Claude - | Codex -")
+        self.assertEqual(bot._format_usage_presence({}, None, now=NOW), "Claude - · Codex -")
+
+    def test_warning_mark_follows_highest_window(self):
+        bot._record_claude_rate_limit(RATE_LIMIT_EVENT)
+        bot.claude_rate_limits["seven_day"]["used_percent"] = 85.0
+
+        text = bot._format_usage_presence(bot.claude_rate_limits, None, now=NOW)
+
+        self.assertEqual(text, "⚠️Claude 31/85% · Codex -")
 
     def test_window_past_reset_counts_as_zero(self):
         bot._record_claude_rate_limit(RATE_LIMIT_EVENT)
 
         text = bot._format_usage_presence(bot.claude_rate_limits, CODEX_STATE, now=NOW + 7200)
 
-        self.assertTrue(text.startswith("Claude 5시간 0% · 1주 10%"))
+        self.assertTrue(text.startswith("Claude 0/10%"))
 
     async def test_refresh_sets_custom_status_once_per_text(self):
         client = MagicMock()
@@ -92,7 +101,7 @@ class UsagePresenceTests(unittest.IsolatedAsyncioTestCase):
         client.change_presence.assert_awaited_once()
         activity = client.change_presence.await_args.kwargs["activity"]
         self.assertEqual(activity.name, bot.usage_presence["text"])
-        self.assertIn("Claude 5시간", activity.name)
+        self.assertEqual(activity.name, "Claude 31/10% · ⚠️Codex 94%")
 
     async def test_refresh_skips_when_client_not_ready(self):
         client = MagicMock()
