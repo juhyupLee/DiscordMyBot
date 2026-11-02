@@ -9,8 +9,10 @@ channel_backends.json
 channel_codex_sessions.json
 channel_codex_models.json
 channel_reasoning.json
+channel_claude_efforts.json
 codex_deferred_jobs.json
 codex_usage_stats.json
+claude_rate_limits.json
 channel_pending_jobs.json
 scheduled_jobs.json
 .bot_running

@@ -16,6 +16,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+from codex_app_transport import CodexAppTransport, RpcError
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -51,6 +52,17 @@ channel_tasks: dict[int, asyncio.Task] = {}
 # 채널별 실행 중인 Codex 단발 프로세스와 상태 메시지 리소스
 # {channel_id: {"proc", "status_task", "status_msg"}}
 channel_codex_runs: dict[int, dict] = {}
+# Routing and end-of-turn cleanup share a barrier so a rejected steer is queued
+# before the worker drains follow-ups. Locks are bot-loop local, not persisted.
+channel_followup_locks: dict[int, asyncio.Lock] = {}
+
+
+def _followup_lock(channel_id: int) -> asyncio.Lock:
+    return channel_followup_locks.setdefault(channel_id, asyncio.Lock())
+
+
+def _codex_transport_mode() -> str:
+    return "exec" if os.getenv("CODEX_TRANSPORT", "app-server").strip().lower() == "exec" else "app-server"
 
 # 채널별 대기 중인 메시지 큐는 아래 CHANNEL_PENDING_FILE에서 복원한다.
 # 각 항목은 prompt/message_id/image_paths/created_at을 가진 dict이며, 실행 중에는
@@ -69,14 +81,17 @@ BACKENDS_FILE = os.path.join(os.path.dirname(__file__), "channel_backends.json")
 CODEX_SESSIONS_FILE = os.path.join(os.path.dirname(__file__), "channel_codex_sessions.json")
 CODEX_MODELS_FILE = os.path.join(os.path.dirname(__file__), "channel_codex_models.json")
 CODEX_REASONING_FILE = os.path.join(os.path.dirname(__file__), "channel_reasoning.json")
+CLAUDE_EFFORTS_FILE = os.path.join(os.path.dirname(__file__), "channel_claude_efforts.json")
 CODEX_DEFERRED_FILE = os.path.join(os.path.dirname(__file__), "codex_deferred_jobs.json")
 CODEX_USAGE_FILE = os.path.join(os.path.dirname(__file__), "codex_usage_stats.json")
+CLAUDE_RATE_LIMITS_FILE = os.path.join(os.path.dirname(__file__), "claude_rate_limits.json")
 CHANNEL_PENDING_FILE = os.path.join(os.path.dirname(__file__), "channel_pending_jobs.json")
 CODEX_MODELS_CACHE_FILE = os.getenv(
     "CODEX_MODELS_CACHE_FILE",
     os.path.join(os.path.expanduser("~"), ".codex", "models_cache.json"),
 )
 SCHEDULES_FILE = os.path.join(os.path.dirname(__file__), "scheduled_jobs.json")
+UPDATE_RESTART_POLICY_FILE = os.path.join(os.path.dirname(__file__), "update_restart_policy.json")
 SCHEDULE_RUNTIME_FIELDS = {"running", "started_at"}
 CODEX_DEFERRED_RUNTIME_FIELDS = {"running", "started_at"}
 CODEX_LIMIT_RETRY_GRACE_SECONDS = 60
@@ -87,7 +102,14 @@ CODEX_CLAUDE_AUDIT_INTERVAL_MINUTES = 60
 CODEX_USAGE_RETENTION_DAYS = 90
 CODEX_RATE_LIMIT_CACHE_SECONDS = 5 * 60
 CODEX_RATE_LIMIT_FAILURE_CACHE_SECONDS = 60
+USAGE_PRESENCE_REFRESH_SECONDS = 5 * 60
+USAGE_WARN_PERCENT = 80
+CHANNEL_TOPIC_MARKER = "🤖 "  # 채널 토픽 첫 줄 중 봇이 관리하는 줄의 시작
+CHANNEL_TOPIC_SYNC_DELAY_SECONDS = 3  # 연달아 바꿀 때 한 번에 반영 (토픽 변경은 10분에 2회 제한)
+# Claude CLI rate_limit_event의 창 이름 → 창 길이(분)
+CLAUDE_RATE_LIMIT_WINDOWS = {"five_hour": 5 * 60, "seven_day": 7 * 24 * 60}
 JSONL_MAX_LINE_BYTES = 64 * 1024 * 1024
+maintenance_restarting = False
 CODEX_USAGE_TOKEN_FIELDS = (
     "input_tokens",
     "cached_input_tokens",
@@ -189,11 +211,27 @@ def load_schedules() -> dict[str, dict]:
             data = json.load(f)
         if not isinstance(data, dict):
             return {}
-        return {
+        jobs = {
             str(job_id): _persistable_schedule_job(job)
             for job_id, job in data.items()
             if isinstance(job, dict)
         }
+        for job in jobs.values():
+            job.pop("auto_restart_after_update", None)
+        # Kept separate so an already-running old bot cannot erase this policy
+        # when it saves its in-memory schedule snapshot before the next restart.
+        try:
+            with open(UPDATE_RESTART_POLICY_FILE, encoding="utf-8") as f:
+                policy = json.load(f)
+            if policy.get("enabled") is True and isinstance(policy.get("job_ids"), list):
+                for job_id in policy["job_ids"]:
+                    if str(job_id) in jobs:
+                        jobs[str(job_id)]["auto_restart_after_update"] = True
+        except (OSError, ValueError, AttributeError):
+            # Unknown policy never enables restart.
+            for job in jobs.values():
+                job.pop("auto_restart_after_update", None)
+        return jobs
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
@@ -360,18 +398,26 @@ def save_sessions():
 
 def save_models():
     save_json_dict(MODELS_FILE, channel_models)
+    _schedule_channel_topic_sync()
 
 def save_backends():
     save_json_dict(BACKENDS_FILE, channel_backends)
+    _schedule_channel_topic_sync()
 
 def save_codex_sessions():
     save_json_dict(CODEX_SESSIONS_FILE, channel_codex_sessions)
 
 def save_codex_models():
     save_json_dict(CODEX_MODELS_FILE, channel_codex_models)
+    _schedule_channel_topic_sync()
 
 def save_codex_reasoning():
     save_json_dict(CODEX_REASONING_FILE, channel_reasoning)
+    _schedule_channel_topic_sync()
+
+def save_claude_efforts():
+    save_json_dict(CLAUDE_EFFORTS_FILE, channel_claude_efforts)
+    _schedule_channel_topic_sync()
 
 channel_workdirs: dict[int, str] = load_json_dict(WORKDIRS_FILE)
 channel_sessions: dict[int, str] = load_json_dict(SESSIONS_FILE)
@@ -380,6 +426,7 @@ channel_backends: dict[int, str] = load_json_dict(BACKENDS_FILE)  # "claude" | "
 channel_codex_sessions: dict[int, str] = load_json_dict(CODEX_SESSIONS_FILE)  # 채널별 codex thread_id
 channel_codex_models: dict[int, str] = load_json_dict(CODEX_MODELS_FILE)  # 채널별 Codex model slug
 channel_reasoning: dict[int, str] = load_json_dict(CODEX_REASONING_FILE)  # 채널별 Codex reasoning effort
+channel_claude_efforts: dict[int, str] = load_json_dict(CLAUDE_EFFORTS_FILE)  # 채널별 Claude effort
 scheduled_jobs: dict[str, dict] = load_schedules()
 for _job in scheduled_jobs.values():
     _job.pop("running", None)
@@ -395,6 +442,18 @@ codex_rate_limit_cache: dict = {
     "state": None,
 }
 scheduler_task: asyncio.Task | None = None
+claude_rate_limits: dict = {}  # 창 이름 → {"used_percent", "resets_at"(epoch)}, 재시작 후에도 유지
+try:
+    with open(CLAUDE_RATE_LIMITS_FILE, "r", encoding="utf-8") as _f:
+        _loaded = json.load(_f)
+    if isinstance(_loaded, dict):
+        claude_rate_limits.update(_loaded)
+except (OSError, json.JSONDecodeError):
+    pass
+usage_presence: dict = {"client": None, "text": None, "task": None}
+channel_topic_sync: dict = {"task": None, "dirty": False, "error": None}
+# 채널별 실제 Claude 모델: (설정값, CLI init 이벤트의 모델) — 설정이 바뀌면 다음 턴까지 설정값을 보여준다
+channel_active_claude_models: dict[int, tuple[str | None, str]] = {}
 
 MODEL_ALIASES = ["opus", "sonnet", "haiku"]
 BACKEND_OPTIONS = ["claude", "codex"]
@@ -407,32 +466,11 @@ SELECT_MODEL_OPTIONS = [
         "description": "환경설정의 Codex 기본 모델",
     },
     {
-        "value": "claude-opus-5",
-        "label": "Claude Opus 5.0",
+        "value": "claude-opus-5-5",
+        "label": "Claude Opus 5.5",
         "backend": "claude",
-        "model": "claude-opus-5",
-        "description": "Claude Opus 5.0 고정",
-    },
-    {
-        "value": "claude-opus-4-8",
-        "label": "Claude Opus 4.8",
-        "backend": "claude",
-        "model": "claude-opus-4-8",
-        "description": "Claude Opus 4.8 고정",
-    },
-    {
-        "value": "claude-opus-4-7",
-        "label": "Claude Opus 4.7",
-        "backend": "claude",
-        "model": "claude-opus-4-7",
-        "description": "Claude Opus 4.7 고정",
-    },
-    {
-        "value": "claude-opus-4-6",
-        "label": "Claude Opus 4.6",
-        "backend": "claude",
-        "model": "claude-opus-4-6",
-        "description": "Claude Opus 4.6 고정",
+        "model": "claude-opus-5-5",
+        "description": "Claude Opus 5.5 고정",
     },
     {
         "value": "opus",
@@ -460,17 +498,12 @@ SELECT_MODEL_ALIASES = {
     "default": "codex",
     "highest": "codex",
     "codex-highest": "codex",
-    "gpt-6": "gpt-6-sol",
+    "gpt-6": "gpt-6.1-sol",
+    "gpt-6.1": "gpt-6.1-sol",
     "gpt-5.6": "gpt-5.6-sol",
-    "opus-5": "claude-opus-5",
-    "opus-5.0": "claude-opus-5",
-    "opus5": "claude-opus-5",
-    "opus-4.8": "claude-opus-4-8",
-    "opus-4-8": "claude-opus-4-8",
-    "opus-4.7": "claude-opus-4-7",
-    "opus-4-7": "claude-opus-4-7",
-    "opus-4.6": "claude-opus-4-6",
-    "opus-4-6": "claude-opus-4-6",
+    "opus-5.5": "claude-opus-5-5",
+    "opus-5-5": "claude-opus-5-5",
+    "opus5.5": "claude-opus-5-5",
 }
 SCHEDULE_MODES = ["daily", "every", "once"]
 
@@ -636,7 +669,7 @@ def _unavailable_local_mcp_overrides(config: dict | None = None) -> list[str]:
 
 
 def _resolve_codex_model(channel_id: int | None = None) -> str | None:
-    """Codex 모델 — 채널 선택 > .env > config.toml > gpt-6-sol.
+    """Codex 모델 — 채널 선택 > .env > config.toml > gpt-6.1-sol.
 
     전역 config는 플러그인 로드를 위해 사용하되, 채널별 선택이 항상 우선하도록
     여기서 모델 값을 정해 -m 플래그로 전달한다.
@@ -651,10 +684,11 @@ def _resolve_codex_model(channel_id: int | None = None) -> str | None:
     model = _read_codex_config().get("model")
     if isinstance(model, str) and model.strip():
         return model.strip()
-    return "gpt-6-sol"
+    return "gpt-6.1-sol"
 
 
 REASONING_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+CLAUDE_EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
 REASONING_LABELS = {
     "none": "None",
     "minimal": "Minimal",
@@ -747,7 +781,36 @@ def _resolve_codex_reasoning(channel_id: int | None = None, model: str | None = 
     return _default_codex_reasoning(model)
 
 
+def _default_claude_effort() -> str:
+    """.env의 Claude effort 기본값. 없거나 잘못되면 빈 문자열(CLI 기본값)."""
+    effort = _normalize_reasoning_effort(os.getenv("CLAUDE_EFFORT_LEVEL", ""))
+    return effort if effort in CLAUDE_EFFORT_ORDER else ""
+
+
+def _resolve_claude_effort(channel_id: int) -> str:
+    """Claude effort — 채널 선택 > .env > CLI 기본값(빈 문자열)."""
+    selected = channel_claude_efforts.get(channel_id)
+    if selected in CLAUDE_EFFORT_ORDER:
+        return selected
+    return _default_claude_effort()
+
+
 def _reasoning_options(channel_id: int) -> list[dict]:
+    if channel_backends.get(channel_id, DEFAULT_BACKEND) == "claude":
+        default = _default_claude_effort()
+        options = [{
+            "value": "default",
+            "label": f"Default ({REASONING_LABELS.get(default, default) if default else 'CLI 기본값'})",
+            "description": ".env 기본값 사용",
+        }]
+        for effort in CLAUDE_EFFORT_ORDER:
+            options.append({
+                "value": effort,
+                "label": REASONING_LABELS.get(effort, effort.title()),
+                "description": "Claude effort",
+            })
+        return options
+
     model = _resolve_codex_model(channel_id)
     default = _default_codex_reasoning(model)
     options = [{
@@ -778,16 +841,32 @@ def _reasoning_choices(channel_id: int, current: str = "") -> list[app_commands.
 
 
 def _reasoning_display(channel_id: int) -> str:
+    if channel_backends.get(channel_id, DEFAULT_BACKEND) == "claude":
+        effort = _resolve_claude_effort(channel_id) or "CLI 기본값"
+        source = "channel" if channel_id in channel_claude_efforts else "default"
+        return f"{effort} ({source})"
+
     effort = _resolve_codex_reasoning(channel_id)
     source = "channel" if channel_id in channel_reasoning else "default"
     return f"{effort} ({source})"
 
 
 def apply_selected_reasoning(channel_id: int, value: str) -> tuple[bool, str]:
-    if channel_backends.get(channel_id, DEFAULT_BACKEND) != "codex":
-        return False, "추론 강도 선택은 Codex 백엔드에서만 사용할 수 있습니다."
-
     key = _normalize_reasoning_effort(value)
+
+    if channel_backends.get(channel_id, DEFAULT_BACKEND) == "claude":
+        if key in ("default", "clear", "기본", "해제"):
+            channel_claude_efforts.pop(channel_id, None)
+            save_claude_efforts()
+            effort = _resolve_claude_effort(channel_id) or "CLI 기본값"
+            return True, f"🧠 추론 강도: `{effort}` (기본값, 다음 메시지부터 적용)"
+        if key not in CLAUDE_EFFORT_ORDER:
+            available = " / ".join(CLAUDE_EFFORT_ORDER)
+            return False, f"Claude에서 지원하지 않는 추론 강도: `{value}` (사용 가능: {available})"
+        channel_claude_efforts[channel_id] = key
+        save_claude_efforts()
+        return True, f"🧠 추론 강도: `{key}` / 모델: `{_model_display(channel_id)}` (다음 메시지부터 적용)"
+
     if key in ("default", "clear", "기본", "해제"):
         channel_reasoning.pop(channel_id, None)
         save_codex_reasoning()
@@ -1098,6 +1177,7 @@ class CodexUsageLimitError(RuntimeError):
         super().__init__(message)
         self.retry_at = retry_at
         self.thread_id = thread_id
+        self.followups = []
 
 
 def _resolve_codex_app_server_path() -> str | None:
@@ -1448,6 +1528,8 @@ async def _read_cached_codex_rate_limit_state() -> dict | None:
     )
     codex_rate_limit_cache["state"] = state
     codex_rate_limit_cache["expires_at"] = now + ttl
+    if state is not None:
+        asyncio.create_task(_refresh_usage_presence())
     return state
 
 
@@ -1481,17 +1563,18 @@ def _format_limit_reset(value, *, now: datetime | None = None) -> str:
     return value.strftime("%m/%d %H:%M")
 
 
-def _format_codex_rate_limit_line(state: dict | None, *, now: datetime | None = None) -> str | None:
+def _select_codex_limit_windows(state: dict | None) -> list[dict]:
+    """Codex 한도 창 중 표시할 것(codex 한도 우선, 짧은 창부터 최대 2개)."""
     windows = state.get("windows") if isinstance(state, dict) else None
     if not isinstance(windows, list) or not windows:
-        return None
+        return []
 
     preferred = [
         window for window in windows
         if isinstance(window, dict) and window.get("limit_id") == "codex"
     ]
     selected = preferred or [window for window in windows if isinstance(window, dict)]
-    selected = sorted(
+    return sorted(
         selected,
         key=lambda window: (
             window.get("window_duration_mins")
@@ -1500,6 +1583,12 @@ def _format_codex_rate_limit_line(state: dict | None, *, now: datetime | None = 
         ),
     )[:2]
 
+
+def _format_codex_rate_limit_line(state: dict | None, *, now: datetime | None = None) -> str | None:
+    selected = _select_codex_limit_windows(state)
+    if not selected:
+        return None
+
     parts = []
     for window in selected:
         duration = _format_limit_duration(window.get("window_duration_mins"))
@@ -1507,6 +1596,283 @@ def _format_codex_rate_limit_line(state: dict | None, *, now: datetime | None = 
         reset = _format_limit_reset(window.get("resets_at"), now=now)
         parts.append(f"{duration} {remaining}% 남음({reset})")
     return "⏳ 한도: " + " · ".join(parts) if parts else None
+
+
+def _record_claude_rate_limit(data: dict) -> bool:
+    """Claude CLI rate_limit_event의 창별 사용률을 저장한다. 값이 바뀌었으면 True."""
+    info = data.get("rate_limit_info") if isinstance(data, dict) else None
+    windows = info.get("unifiedWindows") if isinstance(info, dict) else None
+    if not isinstance(windows, dict):
+        return False
+    entries = {}
+    for key in CLAUDE_RATE_LIMIT_WINDOWS:
+        window = windows.get(key)
+        utilization = window.get("utilization") if isinstance(window, dict) else None
+        if not isinstance(utilization, (int, float)):
+            continue
+        # utilization은 0~1 비율 (CLI도 *100 해서 표시)
+        entries[key] = {"used_percent": round(float(utilization) * 100, 1), "resets_at": window.get("resetsAt")}
+    return _store_claude_rate_limits(entries)
+
+
+# `claude -p /usage` 출력 줄 → 창 이름 (문서화되지 않은 출력이라 못 읽으면 응답 기반 값만 쓴다)
+CLAUDE_USAGE_LINE_PATTERNS = {
+    "five_hour": re.compile(r"Current session:\s*([\d.]+)%\s*used(?:\s*·\s*resets\s+([^\n(]+))?"),
+    "seven_day": re.compile(r"Current week \(all models\):\s*([\d.]+)%\s*used(?:\s*·\s*resets\s+([^\n(]+))?"),
+}
+
+
+def _parse_usage_reset(text: str | None, *, now: datetime | None = None) -> float | None:
+    """'Nov 3, 4:10am' / 'Nov 9, 2am' 형태(로컬 시간)를 epoch로 바꾼다."""
+    if not text:
+        return None
+    now = now or datetime.now()
+    cleaned = text.strip().replace(" ", "").upper()
+    for fmt in ("%b%d,%I:%M%p", "%b%d,%I%p"):
+        try:
+            parsed = datetime.strptime(f"{now.year}{cleaned}", f"%Y{fmt}")
+        except ValueError:
+            continue
+        # 연말에 다음 해 날짜가 나오는 경우
+        if parsed < now - timedelta(days=1):
+            parsed = parsed.replace(year=now.year + 1)
+        return parsed.timestamp()
+    return None
+
+
+def _parse_claude_usage_output(text: str, *, now: datetime | None = None) -> dict:
+    entries = {}
+    for key, pattern in CLAUDE_USAGE_LINE_PATTERNS.items():
+        match = pattern.search(text or "")
+        if not match:
+            continue
+        entries[key] = {
+            "used_percent": float(match.group(1)),
+            "resets_at": _parse_usage_reset(match.group(2), now=now),
+        }
+    return entries
+
+
+async def _read_claude_usage_via_cli() -> dict:
+    """`claude -p /usage`로 구독 사용률을 읽는다. 모델을 호출하지 않아 토큰을 쓰지 않는다."""
+    kwargs = dict(stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, cwd=os.path.dirname(__file__))
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    proc = await asyncio.create_subprocess_exec(
+        CLAUDE_PATH, "-p", "/usage", "--output-format", "json",
+        "--no-session-persistence", "--strict-mcp-config", **kwargs,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except BaseException:
+        if proc.returncode is None:
+            proc.kill()
+        raise
+    data = json.loads(stdout.decode("utf-8", errors="replace"))
+    return _parse_claude_usage_output(str(data.get("result", "")))
+
+
+async def _refresh_claude_usage_from_cli():
+    try:
+        entries = await _read_claude_usage_via_cli()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        entries = {}
+        failure = str(e) or type(e).__name__
+    else:
+        failure = "" if entries else "출력에서 사용률을 찾지 못함"
+    if failure:
+        # 같은 실패를 5분마다 반복 기록하지 않는다
+        if usage_presence.get("claude_cli_error") != failure:
+            logger.warning(f"Claude /usage 조회 실패, 응답 기반 값 유지: {failure}")
+        usage_presence["claude_cli_error"] = failure
+        return
+    usage_presence["claude_cli_error"] = None
+    _store_claude_rate_limits(entries)
+
+
+def _store_claude_rate_limits(entries: dict) -> bool:
+    """창별 사용률을 저장한다. 값이 바뀌었으면 True."""
+    changed = False
+    for key, entry in entries.items():
+        if claude_rate_limits.get(key) != entry:
+            claude_rate_limits[key] = entry
+            changed = True
+    if changed:
+        try:
+            with open(CLAUDE_RATE_LIMITS_FILE, "w", encoding="utf-8") as f:
+                json.dump(claude_rate_limits, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            logger.warning(f"Claude 사용량 저장 실패: {e}")
+    return changed
+
+
+def _format_usage_percent(used: float) -> str:
+    text = f"{int(round(used))}%"
+    return f"⚠️{text}" if used >= USAGE_WARN_PERCENT else text
+
+
+def _format_usage_presence(claude_limits: dict, codex_state: dict | None, *, now: float | None = None) -> str:
+    """봇 상태 문구용 한 줄 사용량. 초기화 시각이 지난 창은 0%로 본다."""
+    now = time.time() if now is None else now
+
+    claude_parts = []
+    for key, minutes in CLAUDE_RATE_LIMIT_WINDOWS.items():
+        entry = claude_limits.get(key)
+        used = entry.get("used_percent") if isinstance(entry, dict) else None
+        if not isinstance(used, (int, float)):
+            continue
+        resets_at = entry.get("resets_at")
+        if isinstance(resets_at, (int, float)) and resets_at <= now:
+            used = 0
+        claude_parts.append(f"{_format_limit_duration(minutes)} {_format_usage_percent(used)}")
+
+    codex_parts = []
+    for window in _select_codex_limit_windows(codex_state):
+        used = window.get("used_percent")
+        if not isinstance(used, (int, float)):
+            remaining = window.get("remaining_percent")
+            if not isinstance(remaining, (int, float)):
+                continue
+            used = 100 - remaining
+        resets_at = window.get("resets_at")
+        if isinstance(resets_at, datetime) and resets_at.timestamp() <= now:
+            used = 0
+        codex_parts.append(f"{_format_limit_duration(window.get('window_duration_mins'))} {_format_usage_percent(used)}")
+
+    text = (
+        f"Claude {' · '.join(claude_parts) or '-'}"
+        f" | Codex {' · '.join(codex_parts) or '-'}"
+    )
+    return text[:128]
+
+
+async def _refresh_usage_presence():
+    """봇 상태 문구(멤버 목록 이름 아래)를 현재 사용량으로 갱신한다. 문구가 같으면 건너뛴다."""
+    client = usage_presence.get("client")
+    if client is None or not client.is_ready():
+        return
+    text = _format_usage_presence(claude_rate_limits, codex_rate_limit_cache.get("state"))
+    if text == usage_presence.get("text"):
+        return
+    try:
+        await client.change_presence(activity=discord.CustomActivity(name=text))
+        usage_presence["text"] = text
+    except Exception as e:
+        logger.warning(f"사용량 상태 문구 갱신 실패: {e}")
+
+
+def _claude_default_model_label() -> str:
+    """채널에 모델을 지정하지 않았을 때 CLI가 쓰는 모델(사용자 설정 기준)."""
+    try:
+        with open(os.path.expanduser(r"~\.claude\settings.json"), "r", encoding="utf-8") as f:
+            model = json.load(f).get("model")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        model = None
+    if isinstance(model, str) and model.strip():
+        return model.strip().removesuffix("[1m]")
+    return "기본 모델"
+
+
+def _note_claude_active_model(channel_id: int, model: str):
+    """CLI init 이벤트로 확인한 실제 모델을 기록하고, 바뀌었으면 토픽을 갱신한다."""
+    entry = (channel_models.get(channel_id), model)
+    if channel_active_claude_models.get(channel_id) != entry:
+        channel_active_claude_models[channel_id] = entry
+        _schedule_channel_topic_sync()
+
+
+def _channel_status_line(channel_id: int) -> str:
+    if channel_backends.get(channel_id, DEFAULT_BACKEND) == "codex":
+        model = _resolve_codex_model(channel_id) or "기본 모델"
+        return f"{CHANNEL_TOPIC_MARKER}Codex · {model} · 🧠 {_resolve_codex_reasoning(channel_id)}"
+    configured = channel_models.get(channel_id)
+    active = channel_active_claude_models.get(channel_id)
+    if active and active[0] == configured:
+        model = active[1]
+    else:
+        model = configured or _claude_default_model_label()
+    effort = _resolve_claude_effort(channel_id) or "CLI 기본값"
+    return f"{CHANNEL_TOPIC_MARKER}Claude · {model} · 🧠 {effort}"
+
+
+def _merge_status_topic(topic: str | None, status_line: str) -> str:
+    """기존 토픽에서 봇 관리 줄만 바꾸고, 사용자가 쓴 나머지는 그대로 둔다."""
+    rest = topic or ""
+    first, _, remainder = rest.partition("\n")
+    if first.startswith(CHANNEL_TOPIC_MARKER):
+        rest = remainder
+    return (status_line + (f"\n{rest}" if rest.strip() else ""))[:1024]
+
+
+async def _sync_channel_topics():
+    """Claude 카테고리 채널 토픽에 현재 모델·추론 강도를 표시한다. 바뀐 채널만 수정한다."""
+    client = usage_presence.get("client")
+    if client is None or not client.is_ready():
+        return
+    for guild in client.guilds:
+        for channel in guild.text_channels:
+            if not is_claude_channel(channel):
+                continue
+            topic = _merge_status_topic(channel.topic, _channel_status_line(channel.id))
+            if topic == (channel.topic or ""):
+                continue
+            try:
+                await channel.edit(topic=topic)
+                channel_topic_sync["error"] = None
+            except Exception as e:
+                error = f"{type(e).__name__}: {e}"
+                if channel_topic_sync.get("error") != error:
+                    logger.warning(f"채널 토픽 갱신 실패 ({channel.id}): {error}")
+                channel_topic_sync["error"] = error
+
+
+async def _channel_topic_sync_worker():
+    while channel_topic_sync["dirty"]:
+        channel_topic_sync["dirty"] = False
+        await asyncio.sleep(CHANNEL_TOPIC_SYNC_DELAY_SECONDS)
+        try:
+            await _sync_channel_topics()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"채널 토픽 동기화 오류: {e}")
+
+
+def _schedule_channel_topic_sync():
+    """모델·백엔드·추론 강도가 바뀌면 잠시 뒤 채널 토픽을 갱신한다 (봇 연결 전에는 무시)."""
+    client = usage_presence.get("client")
+    if client is None or not client.is_ready():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    channel_topic_sync["dirty"] = True
+    task = channel_topic_sync.get("task")
+    if task is None or task.done():
+        channel_topic_sync["task"] = loop.create_task(_channel_topic_sync_worker())
+
+
+async def _usage_presence_loop(client):
+    """Claude(/usage)·Codex 한도를 주기적으로 조회해 상태 문구를 갱신한다. 둘 다 토큰을 쓰지 않는다.
+
+    Claude 값은 응답의 rate_limit_event로도 갱신된다.
+    """
+    usage_presence["client"] = client
+    while True:
+        try:
+            await _refresh_claude_usage_from_cli()
+            await _read_cached_codex_rate_limit_state()
+            await _refresh_usage_presence()
+            # 새 채널이나 봇 밖에서 바뀐 Codex 기본값도 반영
+            _schedule_channel_topic_sync()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"사용량 상태 문구 루프 오류: {e}")
+        await asyncio.sleep(USAGE_PRESENCE_REFRESH_SECONDS)
 
 
 def format_codex_usage_message(
@@ -1788,6 +2154,84 @@ async def send_files_to_channel(channel, paths: list[str], *, title: str = "📎
         await channel.send("⚠️ 첨부 제외: " + ", ".join(skipped))
 
 
+class CodexResult(str):
+    """Keep per-run output paths with the text through existing engine callers."""
+
+    def __new__(cls, text, image_paths=()):
+        result = super().__new__(cls, text)
+        result.image_paths = tuple(image_paths)
+        return result
+
+
+def collect_tool_output_images(item: dict, work_dir: str, since_ts: float,
+                               input_paths=()) -> list[str]:
+    """Read completed tool outputs only, never arguments, imageView or history.
+
+    Native imageGeneration.savedPath is authoritative. Generic tool output text
+    must point to a file written during this run; reading an old reference file
+    must not silently publish it. Do not decode base64 or download remote URLs.
+    """
+    kind = item.get("type")
+    if item.get("status") in ("failed", "in_progress", "inProgress") or item.get("success") is False:
+        return []
+    native = kind in ("image_generation", "imageGeneration")
+    if native:
+        if item.get("failure"):
+            return []
+        payload = item.get("savedPath") or item.get("saved_path")
+    elif kind in ("mcp_tool_call", "mcpToolCall"):
+        if item.get("error"):
+            return []
+        payload = item.get("result")
+    elif kind in ("dynamic_tool_call", "dynamicToolCall"):
+        payload = item.get("contentItems") or item.get("content_items")
+    elif kind in ("function_call_output", "functionCallOutput"):
+        payload = item.get("output")
+    elif kind in ("command_execution", "commandExecution"):
+        if item.get("exitCode", item.get("exit_code", 0)) not in (0, None):
+            return []
+        payload = item.get("aggregatedOutput") or item.get("aggregated_output")
+        work_dir = item.get("cwd") or work_dir
+    else:
+        return []
+
+    excluded = {os.path.normcase(os.path.abspath(p)) for p in input_paths}
+    paths = []
+    pending = [payload]
+    # Bound traversal and text parsing even for large/malformed tool results.
+    for _ in range(512):
+        if not pending or len(paths) >= AUTO_ATTACH_IMAGE_LIMIT:
+            break
+        value = pending.pop()
+        if isinstance(value, dict):
+            pending.extend(v for k, v in reversed(list(value.items()))
+                           if k not in ("arguments", "inputImages", "input_images", "data",
+                                        "encrypted_content", "image_url", "imageUrl", "audio_url"))
+            continue
+        if isinstance(value, list):
+            pending.extend(reversed(value[:512]))
+            continue
+        if not isinstance(value, str) or not value or len(value) > 65536:
+            continue
+        if value.lower().startswith(("data:", "http:", "https:", "file:", "\\\\", "//")):
+            continue
+        candidates = extract_image_paths_from_text(value, work_dir)
+        if os.path.splitext(value)[1].lower() in IMAGE_EXTS:
+            candidates.insert(0, normalize_reported_image_path(value, work_dir))
+        for path in candidates:
+            try:
+                if (not os.path.isfile(path) or os.path.normcase(os.path.abspath(path)) in excluded
+                        or (not native and os.path.getmtime(path) < since_ts)):
+                    continue
+            except (OSError, ValueError):
+                continue
+            if os.path.normcase(path) not in {os.path.normcase(p) for p in paths}:
+                paths.append(path)
+            if len(paths) >= AUTO_ATTACH_IMAGE_LIMIT:
+                break
+    return paths
+
+
 async def send_screenshot_outputs_if_requested(channel, prompt: str, work_dir: str, since_ts: float, result_text: str = ""):
     requested = wants_screenshot_attachment(prompt)
     reported_images = extract_image_paths_from_text(result_text, work_dir)
@@ -1795,17 +2239,23 @@ async def send_screenshot_outputs_if_requested(channel, prompt: str, work_dir: s
     # 사용자가 이미지 첨부를 명시하지 않았더라도 최종 답변이 실제 이미지
     # 파일을 보고하면 Discord에 전달한다. 단순한 "PNG 형식" 언급은
     # extract_image_paths_from_text()의 파일 존재 검사에서 제외된다.
-    if not requested and not reported_images:
+    tool_images = getattr(result_text, "image_paths", ())
+    if not requested and not reported_images and not tool_images:
         return
 
-    candidates = list(reported_images)
-    if requested:
+    candidates = list(tool_images) + reported_images
+    # Codex results carry current-run provenance, including an empty list. Do
+    # not scan shared folders and accidentally attach another channel's image.
+    # Retain the existing fallback for the separate Claude engine.
+    if requested and not isinstance(result_text, CodexResult):
         candidates.extend(collect_recent_images(work_dir, since_ts))
 
     images = []
     for path in candidates:
-        if path not in images:
+        if os.path.normcase(path) not in {os.path.normcase(p) for p in images}:
             images.append(path)
+        if len(images) >= AUTO_ATTACH_IMAGE_LIMIT:
+            break
     if not images:
         if requested:
             await channel.send("📷 새로 생성된 스크린샷 파일을 찾지 못했습니다.")
@@ -1969,9 +2419,15 @@ async def spawn_persistent_proc(channel_id: int, work_dir: str) -> dict:
     if model:
         cmd += ["--model", model]
 
-    logger.info(f"Claude persistent 프로세스 시작: cwd={work_dir}, channel={channel_id}, resume={session_id}, model={model or '(default)'}")
+    effort = _resolve_claude_effort(channel_id)
+    if effort:
+        cmd += ["--effort", effort]
+
+    logger.info(f"Claude persistent 프로세스 시작: cwd={work_dir}, channel={channel_id}, resume={session_id}, model={model or '(default)'}, effort={effort or '(default)'}")
 
     env = os.environ.copy()
+    # CLI에서 이 환경변수가 --effort보다 우선하므로 채널 선택이 무시되지 않게 제거
+    env.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
     # Unity 빌드용 환경변수 — .env에 설정된 경우만 전달
     for key in ("ANDROID_HOME", "JAVA_HOME"):
         val = os.getenv(key)
@@ -1998,6 +2454,7 @@ async def spawn_persistent_proc(channel_id: int, work_dir: str) -> dict:
     session = {
         "proc": proc,
         "work_dir": work_dir,
+        "effort": effort,
         "reader_task": reader_task,
         "stderr_task": stderr_task,
         "stderr_buffer": stderr_buffer,
@@ -2005,6 +2462,9 @@ async def spawn_persistent_proc(channel_id: int, work_dir: str) -> dict:
         "last_active": _time.time(),
         "session_id": session_id,
         "lock": asyncio.Lock(),
+        "carry": [],                # 자동 턴 감지용으로 먼저 읽은 이벤트
+        "idle_task": None,          # 턴 사이 출력 감시 태스크
+        "notify_channel": None,     # 자동 턴 결과를 보낼 채널
     }
     channel_claude_procs[channel_id] = session
     return session
@@ -2015,6 +2475,7 @@ async def kill_channel_proc(channel_id: int):
     session = channel_claude_procs.pop(channel_id, None)
     if not session:
         return
+    _cancel_claude_idle_watch(session)
     proc = session["proc"]
     reader_task = session["reader_task"]
     stderr_task = session.get("stderr_task")
@@ -2094,12 +2555,21 @@ async def _stop_channel_codex_run(channel_id: int) -> bool:
     if not run:
         return False
 
+    client = run.get("client")
+    if client:
+        try:
+            await asyncio.wait_for(client.interrupt(), timeout=2)
+        except Exception:
+            pass  # Process-tree termination remains the final stop guarantee.
+
     status_task = run.get("status_task")
     if status_task and not status_task.done():
         status_task.cancel()
         await asyncio.gather(status_task, return_exceptions=True)
 
     await _terminate_process_tree(run.get("proc"))
+    if client:
+        await client.close()
 
     status_msg = run.get("status_msg")
     if status_msg:
@@ -2115,7 +2585,7 @@ async def _stop_channel_codex_run(channel_id: int) -> bool:
 
 
 async def get_or_spawn_proc(channel_id: int, work_dir: str) -> dict:
-    """기존 세션 반환 또는 신규 생성. 프로세스 죽었거나 work_dir 변경 시 재생성."""
+    """기존 세션 반환 또는 신규 생성. 프로세스 죽었거나 work_dir/effort 변경 시 재생성."""
     session = channel_claude_procs.get(channel_id)
     if session:
         proc = session["proc"]
@@ -2127,6 +2597,10 @@ async def get_or_spawn_proc(channel_id: int, work_dir: str) -> dict:
             logger.info(f"채널 {channel_id}: work_dir 변경, 재생성 ({session['work_dir']} → {work_dir})")
             await kill_channel_proc(channel_id)
             session = None
+        elif session.get("effort") != _resolve_claude_effort(channel_id):
+            logger.info(f"채널 {channel_id}: effort 변경, 재생성 ({session.get('effort')} → {_resolve_claude_effort(channel_id)})")
+            await kill_channel_proc(channel_id)
+            session = None
 
     if session is None:
         session = await spawn_persistent_proc(channel_id, work_dir)
@@ -2136,7 +2610,8 @@ async def get_or_spawn_proc(channel_id: int, work_dir: str) -> dict:
 async def send_user_message(session: dict, content: str):
     """Claude 프로세스에 user 메시지 JSON 라인 전송. 전송 전 이전 턴 잔여 이벤트 드레인."""
     queue: asyncio.Queue = session["event_queue"]
-    drained = 0
+    drained = len(session.get("carry") or [])
+    session.get("carry", []).clear()
     while not queue.empty():
         try:
             queue.get_nowait()
@@ -2151,6 +2626,89 @@ async def send_user_message(session: dict, content: str):
     line = json.dumps(msg, ensure_ascii=False) + "\n"
     proc.stdin.write(line.encode("utf-8"))
     await proc.stdin.drain()
+
+
+# 턴이 끝난 뒤 이 이벤트가 오면 Claude가 스스로 새 턴을 시작한 것(백그라운드 작업 완료 알림 등)
+CLAUDE_AUTO_TURN_EVENT_TYPES = ("stream_event", "assistant", "user", "result")
+
+
+def _cancel_claude_idle_watch(session: dict):
+    task = session.get("idle_task")
+    session["idle_task"] = None
+    if task and not task.done():
+        task.cancel()
+
+
+def _start_claude_idle_watch(channel_id: int, session: dict):
+    _cancel_claude_idle_watch(session)
+    session["idle_task"] = asyncio.create_task(_claude_idle_watch(channel_id, session))
+
+
+async def _claude_idle_watch(channel_id: int, session: dict):
+    """턴 사이에도 출력을 지켜보다가 Claude가 스스로 시작한 턴을 디스코드로 전달한다."""
+    queue: asyncio.Queue = session["event_queue"]
+    while True:
+        data = await queue.get()
+        if data.get("__eof__"):
+            session["idle_task"] = None
+            logger.info(f"채널 {channel_id}: 대기 중 Claude 프로세스 종료 ({data.get('__error__', 'EOF')})")
+            return
+        if data.get("type") in CLAUDE_AUTO_TURN_EVENT_TYPES:
+            break
+        if data.get("type") == "rate_limit_event" and _record_claude_rate_limit(data):
+            asyncio.create_task(_refresh_usage_presence())
+
+    # 여기부터는 자동 턴 — 사용자 턴이 시작돼도 취소되지 않게 감시 태스크에서 분리
+    session["idle_task"] = None
+    session["carry"].append(data)
+    if channel_claude_procs.get(channel_id) is not session or session["lock"].locked():
+        return
+
+    logger.info(f"채널 {channel_id}: Claude 자동 턴 감지, 디스코드로 전달")
+    channel = session.get("notify_channel")
+    owns_busy = not channel_busy.get(channel_id)
+    current_task = asyncio.current_task()
+    if owns_busy:
+        channel_busy[channel_id] = True
+        channel_tasks[channel_id] = current_task
+    try:
+        result = await _run_claude_once(None, session["work_dir"], channel_id,
+                                        status_channel=channel, auto_turn=True)
+        if channel and (result.startswith("오류") or result == "(빈 응답)"):
+            await channel.send(f"```\n{result}\n```")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error(f"채널 {channel_id}: Claude 자동 턴 처리 오류: {e}", exc_info=True)
+    finally:
+        if owns_busy:
+            if channel_tasks.get(channel_id) is current_task:
+                channel_tasks.pop(channel_id, None)
+            channel_status.pop(channel_id, None)
+            if not await _resume_channel_pending(channel_id, channel):
+                channel_busy[channel_id] = False
+
+
+async def _resume_channel_pending(channel_id: int, channel) -> bool:
+    """대기 중인 요청이 있으면 합쳐서 이어서 처리한다. 처리를 시작했으면 True."""
+    pending_list = _pop_channel_pending(channel_id)
+    if not pending_list:
+        return False
+    message = pending_list[-1].get("message")
+    if message is None and channel is not None:
+        message = await channel.send("▶ 대기 요청을 이어서 처리합니다.")
+    if message is None:
+        channel_pending[channel_id] = pending_list
+        save_channel_pending()
+        return False
+    channel_busy[channel_id] = True
+    channel_tasks[channel_id] = asyncio.create_task(_process_channel(
+        channel_id,
+        "\n\n".join(item["prompt"] for item in pending_list),
+        message,
+        [path for item in pending_list for path in item.get("image_paths", [])],
+    ))
+    return True
 
 
 MAX_RETRIES = 2
@@ -2214,7 +2772,8 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
                     image_paths: list[str] | None = None,
                     status_channel: discord.TextChannel | None = None,
                     reply_to: discord.Message | None = None) -> str:
-    """codex CLI exec 모드 실행. --json 출력 파싱 + 세션(thread_id) 자동 재개."""
+    """Codex 턴 실행. 기본 stdio app-server, CODEX_TRANSPORT=exec로 복귀."""
+    use_app_server = _codex_transport_mode() == "app-server"
 
     status_msg = None
     if status_channel:
@@ -2230,7 +2789,7 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
     # 전역 config.toml을 읽어 설치된 플러그인(Chrome 포함)을 모든 채널에 로드한다.
     # 연결되지 않은 localhost HTTP MCP만 _codex_exec_base_args에서 이번 턴에 끈다.
     # 채널별 모델/추론 강도는 -m / -c로 계속 명시 적용한다.
-    base_args = _codex_exec_base_args(channel_id)
+    base_args = [] if use_app_server else _codex_exec_base_args(channel_id)
     if resume_id:
         cmd_args = ["exec", "resume", resume_id] + base_args
     else:
@@ -2249,6 +2808,12 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
         cmd = ["cmd.exe", "/c", CODEX_PATH] + cmd_args
     else:
         cmd = [CODEX_PATH] + cmd_args
+
+    if use_app_server:
+        server_args = ["app-server"]
+        for override in _unavailable_local_mcp_overrides():
+            server_args += ["-c", override]
+        cmd = _codex_command(server_args)
 
     logger.info(
         f"Codex 실행: cwd={work_dir}, channel={channel_id}, resume={resume_id}, "
@@ -2280,7 +2845,11 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
         "proc": proc,
         "status_task": None,
         "status_msg": status_msg,
+        "client": None,
+        "followups": [],
     }
+    app_client = CodexAppTransport(proc, _read_jsonl_line) if use_app_server else None
+    run_state["client"] = app_client
     if channel_id:
         channel_codex_runs[channel_id] = run_state
 
@@ -2482,25 +3051,42 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
 
     # JSONL 파싱
     agent_messages: list[str] = []
+    output_image_paths: list[str] = []
+    output_collection_started_at = time.time()
     new_thread_id: str | None = None
     usage_info: dict | None = None
     error_messages: list[str] = []
     cancelled = False
     turn_completed = False
     try:
-        try:
-            proc.stdin.write(prompt.encode("utf-8"))
-            await proc.stdin.drain()
-            proc.stdin.close()
-        except (BrokenPipeError, ConnectionError, OSError):
-            pass
+        if app_client:
+            try:
+                model = _resolve_codex_model(channel_id)
+                await app_client.start(
+                    prompt, [p for p in (image_paths or []) if os.path.splitext(p)[1].lower() in IMAGE_EXTS],
+                    resume_id=resume_id, cwd=work_dir, model=model,
+                    effort=_resolve_codex_reasoning(channel_id, model),
+                )
+            except Exception as error:
+                # stdout may already be EOF. Keep the diagnostic out of that
+                # terminal stream; otherwise an AssertionError masks the cause.
+                error_messages.append(f"{type(error).__name__}: {error}")
+                logger.warning("채널 %s: App Server 시작/재개 실패: %s", channel_id, error)
+                await app_client.close()
+        else:
+            try:
+                proc.stdin.write(prompt.encode("utf-8"))
+                await proc.stdin.drain()
+                proc.stdin.close()
+            except (BrokenPipeError, ConnectionError, OSError):
+                pass
 
         while True:
             # turn.completed가 오기 전까지는 장시간 도구 실행도 끝까지 기다린다.
             # 완료 뒤에는 stdout EOF를 기다리지 않는다. 하위 프로세스가 파이프를
             # 붙잡고 있으면 작업은 끝났는데 Discord 상태만 계속 남을 수 있기 때문이다.
             try:
-                raw_line = await _read_jsonl_line(proc.stdout)
+                raw_line = await _read_jsonl_line(app_client.events if app_client else proc.stdout)
             except JsonlLineTooLargeError as error:
                 logger.warning(f"채널 {channel_id}: Codex JSONL 초대형 줄 건너뜀: {error}")
                 error_messages.append(str(error))
@@ -2522,8 +3108,17 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
             t = ev.get("type", "")
             if t == "thread.started":
                 new_thread_id = ev.get("thread_id")
+                if new_thread_id and channel_id:
+                    # Save before model work/stop, not only on a successful exit.
+                    channel_codex_sessions[channel_id] = new_thread_id
+                    save_codex_sessions()
             elif t == "item.completed":
                 item = ev.get("item", {})
+                for path in collect_tool_output_images(
+                    item, work_dir, output_collection_started_at, image_paths or (),
+                ):
+                    if path not in output_image_paths and len(output_image_paths) < AUTO_ATTACH_IMAGE_LIMIT:
+                        output_image_paths.append(path)
                 if item.get("type") == "agent_message":
                     txt = item.get("text", "")
                     if txt:
@@ -2559,6 +3154,14 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
         await _remove_codex_status()
         raise
     finally:
+        if app_client:
+            # Wait for the in-flight routing decision, including RPC rejection
+            # fallback, before callers can drain queues or release busy state.
+            async with _followup_lock(channel_id):
+                if app_client.thread_id and channel_id:
+                    channel_codex_sessions[channel_id] = app_client.thread_id
+                    save_codex_sessions()
+                await app_client.close()
         if proc.returncode is None:
             if cancelled:
                 await _terminate_process_tree(proc)
@@ -2594,7 +3197,7 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
     result_text = agent_messages[-1].strip() if agent_messages else ""
 
     # turn.completed 이후 잔여 프로세스를 강제 정리한 종료 코드는 실패가 아니다.
-    if not turn_completed and proc.returncode != 0:
+    if not turn_completed and (app_client or proc.returncode != 0):
         stderr_text = stderr.decode("utf-8", errors="replace").strip()
         combined_error = "\n".join(part for part in (
             stderr_text,
@@ -2612,11 +3215,13 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
                 channel_codex_sessions[channel_id] = thread_id
                 save_codex_sessions()
             await _remove_codex_status()
-            raise CodexUsageLimitError(
+            quota_error = CodexUsageLimitError(
                 err_tail or "Codex 사용량 제한에 도달했습니다.",
                 retry_at=retry_at,
                 thread_id=thread_id,
             )
+            quota_error.followups = run_state["followups"]
+            raise quota_error
 
         # 강제 중지·일시적 CLI 오류로 맥락을 잃지 않도록, 실제로 스레드가
         # 존재하지 않는다는 오류가 확인된 경우에만 fresh start로 전환한다.
@@ -2624,14 +3229,22 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
             channel_codex_sessions.pop(channel_id, None)
             save_codex_sessions()
             logger.warning(f"채널 {channel_id}: 존재하지 않는 codex thread_id 폐기")
-        if not result_text:
+        if app_client or not result_text:
             await _remove_codex_status()
+            if "AuthRequiredError" in combined_error:
+                return (
+                    "오류 발생: MCP 로그인이 필요합니다. 인증하지 않은 MCP를 "
+                    "비활성화하거나 OAuth 로그인을 완료한 뒤 다시 시도해주세요.\n"
+                    f"{err_tail}"
+                )
             return f"오류 발생: Codex 종료 (returncode={proc.returncode})\n{err_tail}"
 
     await _remove_codex_status()
 
     if not result_text:
-        return "(빈 응답)"
+        if not output_image_paths:
+            return CodexResult("(빈 응답)")
+        result_text = "이미지 결과물을 생성했습니다."
 
     channel_daily_usage = None
     if usage_info and channel_id:
@@ -2666,7 +3279,7 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
             except Exception as e:
                 logger.warning(f"채널 {channel_id}: Codex 사용량 표시 실패: {e}")
 
-    return result_text
+    return CodexResult(result_text, output_image_paths)
 
 
 async def run_claude(prompt: str, work_dir: str, channel_id: int = 0,
@@ -2701,11 +3314,15 @@ async def run_claude(prompt: str, work_dir: str, channel_id: int = 0,
     return result
 
 
-async def _run_claude_once(prompt: str, work_dir: str, channel_id: int = 0,
+async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 0,
                            image_paths: list[str] | None = None,
                            status_channel: discord.TextChannel | None = None,
-                           reply_to: discord.Message | None = None) -> str:
-    """run_claude의 단일 실행. persistent 프로세스에서 턴 단위로 실행."""
+                           reply_to: discord.Message | None = None,
+                           auto_turn: bool = False) -> str:
+    """run_claude의 단일 실행. persistent 프로세스에서 턴 단위로 실행.
+
+    auto_turn이면 메시지를 보내지 않고, Claude가 스스로 시작한 턴의 출력만 받아 전달한다.
+    """
 
     import time as _time
 
@@ -2713,55 +3330,71 @@ async def _run_claude_once(prompt: str, work_dir: str, channel_id: int = 0,
     if channel_id:
         channel_recent_files[channel_id] = []
 
-    # spawn이 필요한지 미리 판단해서, 필요하면 "준비 중" 메시지를 즉시 띄운다
-    existing = channel_claude_procs.get(channel_id)
-    needs_spawn = (
-        existing is None
-        or existing["proc"].returncode is not None
-        or existing["work_dir"] != work_dir
-    )
     pre_spawn_msg = None
-    if needs_spawn and status_channel:
-        try:
-            if channel_sessions.get(channel_id):
-                pre_spawn_msg = await status_channel.send("🔧 Claude 세션 복원 중... (수 초~수십 초 소요)")
-            else:
-                pre_spawn_msg = await status_channel.send("🔧 Claude 프로세스 시작 중...")
-        except Exception:
-            pass
+    if auto_turn:
+        session = channel_claude_procs.get(channel_id)
+        if session is None:
+            return "(빈 응답)"
+    else:
+        # 턴 사이 감시를 멈추고, 자동 턴이 진행 중이면 끝날 때까지 기다린 뒤 프로세스를 판단한다
+        existing = channel_claude_procs.get(channel_id)
+        while existing:
+            _cancel_claude_idle_watch(existing)
+            if not existing["lock"].locked():
+                break
+            async with existing["lock"]:
+                pass
+            existing = channel_claude_procs.get(channel_id)
 
-    try:
-        session = await get_or_spawn_proc(channel_id, work_dir)
-    except FileNotFoundError:
-        if pre_spawn_msg:
+        # spawn이 필요한지 미리 판단해서, 필요하면 "준비 중" 메시지를 즉시 띄운다
+        needs_spawn = (
+            existing is None
+            or existing["proc"].returncode is not None
+            or existing["work_dir"] != work_dir
+        )
+        if needs_spawn and status_channel:
             try:
-                await pre_spawn_msg.delete()
+                if channel_sessions.get(channel_id):
+                    pre_spawn_msg = await status_channel.send("🔧 Claude 세션 복원 중... (수 초~수십 초 소요)")
+                else:
+                    pre_spawn_msg = await status_channel.send("🔧 Claude 프로세스 시작 중...")
             except Exception:
                 pass
-        return f"claude CLI를 찾을 수 없습니다: {CLAUDE_PATH}"
-    except Exception as e:
-        if pre_spawn_msg:
-            try:
-                await pre_spawn_msg.delete()
-            except Exception:
-                pass
-        logger.error(f"프로세스 생성 실패: {e}", exc_info=True)
-        return f"오류 발생: {e}"
+
+        try:
+            session = await get_or_spawn_proc(channel_id, work_dir)
+        except FileNotFoundError:
+            if pre_spawn_msg:
+                try:
+                    await pre_spawn_msg.delete()
+                except Exception:
+                    pass
+            return f"claude CLI를 찾을 수 없습니다: {CLAUDE_PATH}"
+        except Exception as e:
+            if pre_spawn_msg:
+                try:
+                    await pre_spawn_msg.delete()
+                except Exception:
+                    pass
+            logger.error(f"프로세스 생성 실패: {e}", exc_info=True)
+            return f"오류 발생: {e}"
 
     session["last_active"] = _time.time()
 
     try:
         async with session["lock"]:
             # user 메시지 전송 (stdin 실패 시 재생성 후 1회 재시도)
-            try:
-                await send_user_message(session, prompt)
-            except (BrokenPipeError, ConnectionError, OSError) as e:
-                logger.warning(f"채널 {channel_id}: stdin write 실패 ({e}), 프로세스 재시작")
-                await kill_channel_proc(channel_id)
-                session = await spawn_persistent_proc(channel_id, work_dir)
-                await send_user_message(session, prompt)
+            if not auto_turn:
+                try:
+                    await send_user_message(session, prompt)
+                except (BrokenPipeError, ConnectionError, OSError) as e:
+                    logger.warning(f"채널 {channel_id}: stdin write 실패 ({e}), 프로세스 재시작")
+                    await kill_channel_proc(channel_id)
+                    session = await spawn_persistent_proc(channel_id, work_dir)
+                    await send_user_message(session, prompt)
 
             event_queue: asyncio.Queue = session["event_queue"]
+            carry: list = session["carry"]
 
             new_session_id = None
             status_msg = None          # 도구 상태 표시용 메시지
@@ -2774,18 +3407,22 @@ async def _run_claude_once(prompt: str, work_dir: str, channel_id: int = 0,
             is_thinking = False        # thinking 블록 진행 중 여부
 
             if status_channel:
+                processing_text = (
+                    "🔔 백그라운드 작업 알림으로 Claude가 이어서 응답 중..."
+                    if auto_turn else "⏳ Claude 처리 중..."
+                )
                 if pre_spawn_msg:
                     try:
-                        await pre_spawn_msg.edit(content="⏳ Claude 처리 중...")
+                        await pre_spawn_msg.edit(content=processing_text)
                         status_msg = pre_spawn_msg
                     except Exception:
                         try:
-                            status_msg = await status_channel.send("⏳ Claude 처리 중...")
+                            status_msg = await status_channel.send(processing_text)
                         except Exception:
                             pass
                 else:
                     try:
-                        status_msg = await status_channel.send("⏳ Claude 처리 중...")
+                        status_msg = await status_channel.send(processing_text)
                     except Exception:
                         pass
 
@@ -2832,7 +3469,7 @@ async def _run_claude_once(prompt: str, work_dir: str, channel_id: int = 0,
 
             while True:
                 # 장시간 도구 실행도 끝까지 기다린다. 사용자는 `중지` 명령으로 직접 취소할 수 있다.
-                data = await event_queue.get()
+                data = carry.pop(0) if carry else await event_queue.get()
 
                 # 프로세스 EOF (예기치 않은 종료)
                 if data.get("__eof__"):
@@ -2850,6 +3487,8 @@ async def _run_claude_once(prompt: str, work_dir: str, channel_id: int = 0,
                 msg_type = data.get("type", "")
 
                 if msg_type == "system":
+                    if data.get("subtype") == "init" and data.get("model") and channel_id:
+                        _note_claude_active_model(channel_id, data["model"])
                     continue
 
                 # stream_event: 토큰 단위 스트리밍 (--include-partial-messages)
@@ -3033,6 +3672,8 @@ async def _run_claude_once(prompt: str, work_dir: str, channel_id: int = 0,
                     break
 
                 if msg_type == "rate_limit_event":
+                    if _record_claude_rate_limit(data):
+                        asyncio.create_task(_refresh_usage_presence())
                     continue
 
             # 턴 후 상태 정리
@@ -3077,6 +3718,10 @@ async def _run_claude_once(prompt: str, work_dir: str, channel_id: int = 0,
                 save_sessions()
 
             session["last_active"] = _time.time()
+            # 턴이 끝난 뒤 Claude가 스스로 이어서 응답하면(백그라운드 작업 완료 등) 이 채널로 전달
+            if status_channel:
+                session["notify_channel"] = status_channel
+            _start_claude_idle_watch(channel_id, session)
             return result_text or "(빈 응답)"
 
     except asyncio.CancelledError:
@@ -3463,6 +4108,9 @@ async def _park_codex_job(
         codex_deferred_jobs[channel_id] = job
         save_codex_deferred_jobs()
 
+    for followup in error.followups:
+        _append_deferred_request(channel_id, followup["prompt"], followup["image_paths"])
+
     try:
         await channel.send(
             "⏸️ **Codex 사용량 제한으로 작업을 보관했습니다.**\n"
@@ -3678,9 +4326,9 @@ async def _run_deferred_codex_job(bot: commands.Bot, channel_id: int):
             await channel.send("✅ **보관된 Codex 작업 자동 재개 완료**")
     except CodexUsageLimitError as e:
         current = codex_deferred_jobs.get(channel_id, job)
-        current["queued_prompts"] = consumed_prompts + list(current.get("queued_prompts") or [])
+        current["queued_prompts"] = consumed_prompts + [f["prompt"] for f in e.followups] + list(current.get("queued_prompts") or [])
         current["queued_image_paths"] = list(dict.fromkeys(
-            consumed_images + list(current.get("queued_image_paths") or [])
+            consumed_images + [p for f in e.followups for p in f["image_paths"]] + list(current.get("queued_image_paths") or [])
         ))
         current["thread_id"] = e.thread_id or current.get("thread_id")
         current["retry_at"] = _deferred_datetime_text(e.retry_at)
@@ -3840,6 +4488,88 @@ async def _process_channel(ch_id: int, prompt: str, message: discord.Message, im
         channel_status.pop(ch_id, None)
 
 
+async def _maintenance_probe(command: list[str]) -> str:
+    """Read-only probes fail closed; never leave a timed-out probe running."""
+    proc = await asyncio.create_subprocess_exec(
+        *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+    except BaseException:
+        if proc.returncode is None:
+            proc.kill()
+        await proc.communicate()
+        raise
+    if proc.returncode != 0:
+        raise RuntimeError("maintenance probe failed")
+    return stdout.decode("utf-8", errors="replace").strip()
+
+
+async def _installed_stable_codex_version() -> tuple[int, int, int]:
+    output = await _maintenance_probe(_codex_command(["--version"]))
+    match = re.fullmatch(r"codex-cli (\d+)\.(\d+)\.(\d+)", output)
+    if not match:
+        raise ValueError("Cannot verify stable Codex version")
+    return tuple(int(part) for part in match.groups())
+
+
+def _update_restart_blockers() -> list[str]:
+    current = asyncio.current_task()
+    blockers = []
+    if any(channel_busy.values()) or any(channel_status.values()):
+        blockers.append("실행 또는 응답 대기 세션")
+    if any(not task.done() and task is not current for task in channel_tasks.values()):
+        blockers.append("채널 실행 태스크")
+    if channel_codex_runs:
+        blockers.append("Codex 실행 리소스")
+    if any(channel_pending.values()) or codex_deferred_jobs:
+        blockers.append("대기 또는 자동 재개 작업")
+    if any(job.get("running") for job in scheduled_jobs.values()):
+        blockers.append("실행 중 예약 작업")
+    # Persistent Claude workers may own an unanswered tool request. Treat even
+    # an idle worker conservatively rather than killing it on an assumption.
+    if channel_claude_procs:
+        blockers.append("Claude 상주 세션")
+    return blockers
+
+
+async def _restart_after_verified_update(bot: commands.Bot, channel):
+    global maintenance_restarting
+    try:
+        blockers = _update_restart_blockers()
+        if blockers:
+            await channel.send("⏸ 업데이트 후 재시작 보류: " + ", ".join(blockers))
+            return
+        if os.name != "nt":
+            raise RuntimeError("Windows restart supervisor required")
+        supervisor = await _maintenance_probe([
+            "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+            f"$p=Get-CimInstance Win32_Process -Filter 'ProcessId = {os.getpid()}'; "
+            "for($i=0; $i -lt 4 -and $p.ParentProcessId; $i++) { "
+            "$p=Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $p.ParentProcessId); "
+            "if($p.Name -in @('wscript.exe','cscript.exe') -and $p.CommandLine -match 'run_forever[.]vbs') { "
+            "Write-Output 'run_forever.vbs'; break } }",
+        ])
+        if not re.search(r"\brun_forever\.vbs\b", supervisor, re.IGNORECASE):
+            raise RuntimeError("run_forever.vbs supervisor not verified")
+        # Recheck after every await that could have admitted another request.
+        if _update_restart_blockers():
+            await channel.send("⏸ 새 작업이 감지되어 업데이트 후 재시작을 보류합니다.")
+            return
+        maintenance_restarting = True
+        await channel.send("🔄 업데이트 검증 완료. 진행·대기 작업이 없어 봇을 정상 종료 후 재시작합니다.")
+        if _update_restart_blockers():
+            await channel.send("⏸ 재시작 직전 작업이 감지되어 재시작을 보류합니다.")
+            return
+        await bot.close()  # Only this bot exits; run_forever.vbs relaunches it.
+    except Exception as error:
+        logger.warning("업데이트 후 안전 재시작 보류: %s", error)
+        await channel.send(f"⏸ 안전 상태/재시작 경로를 확인하지 못해 재시작 보류: {error}")
+    finally:
+        maintenance_restarting = False
+
+
 async def _run_scheduled_job(bot: commands.Bot, job_id: str, job: dict):
     ch_id = int(job.get("channel_id", 0))
     current_task = asyncio.current_task()
@@ -3879,7 +4609,15 @@ async def _run_scheduled_job(bot: commands.Bot, job_id: str, job: dict):
     channel_busy[ch_id] = True
     if current_task:
         channel_tasks[ch_id] = current_task
+    verified_update = False
+    cancelled = False
     try:
+        before_version = None
+        if job.get("auto_restart_after_update") is True:
+            try:
+                before_version = await _installed_stable_codex_version()
+            except Exception as error:
+                logger.warning("업데이트 전 버전 확인 실패, 자동 재시작 제외: %s", error)
         await channel.send(f"⏰ 예약 작업 `{job_id}` 시작")
         work_dir = channel_workdirs.get(ch_id, WORKING_DIR)
         backend = channel_backends.get(ch_id, DEFAULT_BACKEND)
@@ -3892,6 +4630,14 @@ async def _run_scheduled_job(bot: commands.Bot, job_id: str, job: dict):
         if result.startswith("⏰") or result.startswith("오류") or result == "(빈 응답)":
             await channel.send(f"```\n{result}\n```")
         await send_screenshot_outputs_if_requested(channel, prompt, work_dir, turn_started_at, result)
+        if before_version is not None and not (
+            result.startswith(("⏰", "오류")) or result == "(빈 응답)"
+            or "설치 실패" in result or "업데이트 실패" in result
+        ):
+            try:
+                verified_update = await _installed_stable_codex_version() > before_version
+            except Exception as error:
+                logger.warning("업데이트 후 버전 확인 실패, 자동 재시작 제외: %s", error)
 
         job["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if job.get("mode") == "once":
@@ -3926,6 +4672,7 @@ async def _run_scheduled_job(bot: commands.Bot, job_id: str, job: dict):
     except asyncio.CancelledError:
         # 수동 중지는 이번 실행만 끝낸다. 반복 예약은 다음 정상 주기로 넘기고,
         # 1회 예약은 다시 즉시 실행되지 않도록 제거한다.
+        cancelled = True
         if job.get("mode") == "once":
             scheduled_jobs.pop(job_id, None)
             save_schedules(deleted_ids={job_id})
@@ -3939,6 +4686,7 @@ async def _run_scheduled_job(bot: commands.Bot, job_id: str, job: dict):
         raise
     except Exception as e:
         logger.error(f"예약 작업 {job_id} 실행 실패: {e}", exc_info=True)
+        verified_update = False
         try:
             await channel.send(f"```\n예약 작업 `{job_id}` 오류: {e}\n```")
         except Exception:
@@ -3952,6 +4700,29 @@ async def _run_scheduled_job(bot: commands.Bot, job_id: str, job: dict):
         if channel_tasks.get(ch_id) is current_task:
             channel_tasks.pop(ch_id, None)
         channel_status.pop(ch_id, None)
+        if not cancelled:
+            pending_list = _pop_channel_pending(ch_id)
+            if ch_id in codex_deferred_jobs:
+                for entry in pending_list:
+                    _append_deferred_request(ch_id, entry["prompt"], entry.get("image_paths", []))
+            elif pending_list:
+                channel_busy[ch_id] = True
+                pending_message = pending_list[-1].get("message")
+                if pending_message is None:
+                    try:
+                        pending_message = await channel.send("▶ 예약 작업 후 대기 요청을 이어서 처리합니다.")
+                    except Exception as error:
+                        channel_pending[ch_id] = pending_list + channel_pending.get(ch_id, [])
+                        save_channel_pending()
+                        channel_busy[ch_id] = False
+                        logger.warning("예약 후 대기 요청 인계 실패, 큐 보존: %s", error)
+                if pending_message is not None:
+                    channel_tasks[ch_id] = asyncio.create_task(_process_channel(
+                        ch_id, "\n\n".join(e["prompt"] for e in pending_list), pending_message,
+                        [p for e in pending_list for p in e.get("image_paths", [])],
+                    ))
+    if verified_update:
+        await _restart_after_verified_update(bot, channel)
 
 
 async def _resume_persisted_channel_pending(bot: commands.Bot):
@@ -4007,6 +4778,9 @@ async def _scheduler_loop(bot: commands.Bot):
     await bot.wait_until_ready()
     logger.info("예약 작업 + Codex 자동 재개 스케줄러 시작")
     while not bot.is_closed():
+        if maintenance_restarting:
+            await asyncio.sleep(1)
+            continue
         try:
             now = datetime.now()
             due: list[tuple[str, dict]] = []
@@ -4118,32 +4892,69 @@ async def _handle_message(message: discord.Message, bot: commands.Bot):
             return
 
         prompt, image_paths = await _prepare_prompt(message)
+        await _route_channel_prompt(ch_id, prompt, message, image_paths)
+        return
 
-        backend = channel_backends.get(ch_id, DEFAULT_BACKEND)
+
+async def _route_channel_prompt(ch_id: int, prompt: str, message, image_paths: list[str]):
+    """Single admission path for ordinary, prefix and slash Codex messages."""
+    backend = channel_backends.get(ch_id, DEFAULT_BACKEND)
+    force_queue = backend == "codex" and prompt.startswith("대기:")
+    if force_queue:
+        prompt = prompt[len("대기:"):].strip()
+        if not prompt:
+            await message.reply("사용법: `대기: 다음에 처리할 작업`")
+            return
+    async with _followup_lock(ch_id):
+        if backend == "codex" and channel_busy.get(ch_id) and not force_queue:
+            run = channel_codex_runs.get(ch_id)
+            client = run.get("client") if run else None
+            if client:
+                work_dir = channel_workdirs.get(ch_id, WORKING_DIR)
+                steer_prompt = add_screenshot_output_instruction(prompt, work_dir)
+                try:
+                    accepted = await client.steer(steer_prompt, [
+                        p for p in image_paths if os.path.splitext(p)[1].lower() in IMAGE_EXTS
+                    ])
+                except RpcError as error:
+                    # Explicit RPC rejection proves this message wasn't accepted.
+                    logger.info("채널 %s: steer 거절, 다음 턴으로 보관: %s", ch_id, error)
+                    accepted = False
+                except (ConnectionError, OSError, asyncio.TimeoutError) as error:
+                    # Lost ACK may mean the input WAS accepted. Never replay blindly.
+                    logger.warning("채널 %s: steer 수신 여부 불명확 message=%s: %s", ch_id, getattr(message, "id", None), error)
+                    await message.reply("⚠️ 후속 지시 수신 여부를 확인하지 못했습니다. 중복 실행 방지를 위해 자동 재전송하지 않았어요. 결과를 확인한 뒤 필요하면 다시 지시해주세요.")
+                    return
+                if accepted:
+                    run["followups"].append({"prompt": prompt, "image_paths": list(image_paths)})
+                    await message.reply("↪️ 현재 작업에 후속 지시를 전달했습니다.")
+                    return
         if backend == "codex" and ch_id in codex_deferred_jobs:
             job = _append_deferred_request(ch_id, prompt, image_paths)
-            retry_at = job.get("retry_at") if job else "확인 중"
-            queued_count = len(job.get("queued_prompts") or []) if job else 0
-            await message.reply(
-                f"📥 Codex 자동 재개 대기열에 추가했습니다. "
-                f"(추가 요청 {queued_count}개, 재개 예정 `{retry_at}`)"
-            )
+            await message.reply(f"📥 Codex 자동 재개 대기열에 보관했습니다. (재개 예정 `{job.get('retry_at') if job else '확인 중'}`)")
             return
-
-        # 현재 작업 중이면 조용히 대기 큐에 추가 (CLI처럼 자연스럽게)
         if channel_busy.get(ch_id):
             _queue_channel_pending(ch_id, prompt, message, image_paths)
+            if backend == "codex":
+                await message.reply("📥 다음 작업으로 대기열에 보관했습니다.")
             return
-
-        # 작업 시작
         channel_busy[ch_id] = True
         task = asyncio.create_task(_process_channel(ch_id, prompt, message, image_paths))
         channel_tasks[ch_id] = task
-        return
 
 
 def _register_events(bot: commands.Bot):
     """봇 인스턴스에 이벤트와 명령어를 등록"""
+
+    previous_interaction_check = bot.tree.interaction_check
+
+    async def maintenance_interaction_check(interaction):
+        if maintenance_restarting:
+            await interaction.response.send_message("봇 업데이트 재시작 중입니다. 잠시 후 다시 보내주세요.", ephemeral=True)
+            return False
+        return await previous_interaction_check(interaction)
+
+    bot.tree.interaction_check = maintenance_interaction_check
 
     @bot.event
     async def on_ready():
@@ -4169,6 +4980,14 @@ def _register_events(bot: commands.Bot):
         asyncio.create_task(_attachment_cleanup_loop())
         if scheduler_task is None or scheduler_task.done():
             scheduler_task = asyncio.create_task(_scheduler_loop(bot))
+        # 사용량 상태 문구 — 재연결 시에도 다시 적용되도록 마지막 문구를 비운다
+        usage_presence["client"] = bot
+        usage_presence["text"] = None
+        _schedule_channel_topic_sync()
+        if usage_presence.get("task") is None or usage_presence["task"].done():
+            usage_presence["task"] = asyncio.create_task(_usage_presence_loop(bot))
+        else:
+            asyncio.create_task(_refresh_usage_presence())
         asyncio.create_task(_resume_persisted_channel_pending(bot))
 
         # 비정상 종료 후 재시작 감지 → 알림
@@ -4202,6 +5021,9 @@ def _register_events(bot: commands.Bot):
     async def on_message(message: discord.Message):
         """Claude 카테고리 내 채널에서는 모든 메시지를 Claude Code에 전달"""
         if message.author.bot:
+            return
+        if maintenance_restarting:
+            await message.reply("봇 업데이트 재시작 중입니다. 잠시 후 다시 보내주세요.")
             return
 
         try:
@@ -4243,12 +5065,8 @@ def _register_events(bot: commands.Bot):
 
         work_dir = channel_workdirs.get(ctx.channel.id, WORKING_DIR)
         backend = channel_backends.get(ctx.channel.id, DEFAULT_BACKEND)
-        if backend == "codex" and ctx.channel.id in codex_deferred_jobs:
-            job = _append_deferred_request(ctx.channel.id, prompt, image_paths)
-            await ctx.reply(
-                f"📥 Codex 자동 재개 대기열에 추가했습니다. "
-                f"(재개 예정 `{job.get('retry_at') if job else '확인 중'}`)"
-            )
+        if backend == "codex":
+            await _route_channel_prompt(ctx.channel.id, prompt, ctx.message, image_paths)
             return
         engine = run_codex if backend == "codex" else run_claude
         engine_prompt = add_screenshot_output_instruction(prompt, work_dir)
@@ -4303,7 +5121,7 @@ def _register_events(bot: commands.Bot):
         work_dir = channel_workdirs.get(ctx.channel.id, WORKING_DIR)
         backend = channel_backends.get(ctx.channel.id, DEFAULT_BACKEND)
         model = _model_display(ctx.channel.id)
-        reasoning = _reasoning_display(ctx.channel.id) if backend == "codex" else "(codex only)"
+        reasoning = _reasoning_display(ctx.channel.id)
         await ctx.reply(
             f"📁 `{work_dir}`\n🤖 model: `{model}`\n"
             f"🧠 backend: `{backend}`\n💭 reasoning: `{reasoning}`"
@@ -4354,7 +5172,7 @@ def _register_events(bot: commands.Bot):
 
     @bot.command(name="select-model")
     async def select_model_cmd(ctx: commands.Context, *, name: str = ""):
-        """!select-model <codex|claude-opus-4-8|...> - 백엔드와 모델을 함께 변경."""
+        """!select-model <codex|claude-opus-5-5|...> - 백엔드와 모델을 함께 변경."""
         if ctx.author.id != ALLOWED_USER_ID:
             return
         if not name.strip():
@@ -4374,12 +5192,12 @@ def _register_events(bot: commands.Bot):
 
     @bot.command(name="reasoning")
     async def change_reasoning(ctx: commands.Context, *, level: str = ""):
-        """!reasoning <low|medium|high|xhigh|max|ultra|default> - Codex 추론 강도 변경."""
+        """!reasoning <low|medium|high|xhigh|max|ultra|default> - 채널 백엔드의 추론 강도 변경."""
         if ctx.author.id != ALLOWED_USER_ID:
             return
         ch_id = ctx.channel.id
         if not level.strip():
-            model = _resolve_codex_model(ch_id)
+            model = _model_display(ch_id)
             available = " / ".join(option["value"] for option in _reasoning_options(ch_id))
             await ctx.reply(
                 f"현재 추론 강도: `{_reasoning_display(ch_id)}` / 모델: `{model}`\n"
@@ -4619,21 +5437,7 @@ def _register_events(bot: commands.Bot):
         sent_msg = await interaction.followup.send(f"▶ `{prompt[:80]}`")
 
         ch_id = interaction.channel.id
-        backend = channel_backends.get(ch_id, DEFAULT_BACKEND)
-        if backend == "codex" and ch_id in codex_deferred_jobs:
-            job = _append_deferred_request(ch_id, prompt, [])
-            await interaction.followup.send(
-                f"📥 Codex 자동 재개 대기열에 추가했습니다. "
-                f"(재개 예정 `{job.get('retry_at') if job else '확인 중'}`)"
-            )
-            return
-        if channel_busy.get(ch_id):
-            _queue_channel_pending(ch_id, prompt, sent_msg, [])
-            return
-
-        channel_busy[ch_id] = True
-        task = asyncio.create_task(_process_channel(ch_id, prompt, sent_msg, []))
-        channel_tasks[ch_id] = task
+        await _route_channel_prompt(ch_id, prompt, sent_msg, [])
 
     @bot.tree.command(name="skill", description="스킬 실행 (자동완성 지원)")
     @app_commands.describe(name="실행할 스킬", args="추가 인자 (선택)")
@@ -4665,7 +5469,7 @@ def _register_events(bot: commands.Bot):
         work_dir = channel_workdirs.get(interaction.channel.id, WORKING_DIR)
         backend = channel_backends.get(interaction.channel.id, DEFAULT_BACKEND)
         model = _model_display(interaction.channel.id)
-        reasoning = _reasoning_display(interaction.channel.id) if backend == "codex" else "(codex only)"
+        reasoning = _reasoning_display(interaction.channel.id)
         await interaction.response.send_message(
             f"📁 `{work_dir}`\n🤖 model: `{model}`\n"
             f"🧠 backend: `{backend}`\n💭 reasoning: `{reasoning}`", ephemeral=True
@@ -4772,7 +5576,7 @@ def _register_events(bot: commands.Bot):
     async def _select_model_ac(interaction: discord.Interaction, current: str):
         return _select_model_choices(current)
 
-    @bot.tree.command(name="reasoning", description="채널 Codex 추론 강도 선택")
+    @bot.tree.command(name="reasoning", description="채널 추론 강도 선택 (Claude / Codex)")
     @app_commands.describe(level="모델이 지원하는 추론 강도 또는 default")
     async def slash_reasoning(interaction: discord.Interaction, level: str):
         if interaction.user.id != ALLOWED_USER_ID:

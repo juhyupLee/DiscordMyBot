@@ -1,6 +1,10 @@
 import asyncio
 import json
+import os
+import tempfile
+import time
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import bot
@@ -52,6 +56,39 @@ class _LingeringCompletedProcess:
 
 
 class CodexCompletionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_completed_image_event_survives_run_and_reaches_attachment(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir, "native.png")
+            image.write_bytes(b"png")
+            proc = _LingeringCompletedProcess()
+            proc.stdout = asyncio.StreamReader()
+            for event in [
+                {"type": "item.completed", "item": {
+                    "type": "image_generation", "status": "completed", "savedPath": str(image),
+                }},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": "완료"}},
+                {"type": "turn.completed"},
+            ]:
+                proc.stdout.feed_data(json.dumps(event).encode() + b"\n")
+
+            async def terminate(target):
+                target.returncode = -9
+                target._never_exits.set()
+
+            with (
+                patch.dict(os.environ, {"CODEX_TRANSPORT": "exec"}),
+                patch.object(bot.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)),
+                patch.object(bot, "_terminate_process_tree", AsyncMock(side_effect=terminate)),
+                patch.object(bot, "CODEX_COMPLETED_EXIT_GRACE_SECONDS", 0.01),
+                patch.object(bot, "send_files_to_channel", AsyncMock()) as send_files,
+            ):
+                result = await bot.run_codex("만들어줘", temp_dir)
+                self.assertEqual(result, "완료")
+                await bot.send_screenshot_outputs_if_requested(
+                    AsyncMock(), "만들어줘", temp_dir, time.time(), result,
+                )
+            self.assertEqual(send_files.await_args.args[1], [str(image)])
+
     async def test_turn_completed_finishes_without_waiting_for_stdout_eof(self):
         proc = _LingeringCompletedProcess()
 
@@ -61,6 +98,7 @@ class CodexCompletionTests(unittest.IsolatedAsyncioTestCase):
             target._never_exits.set()
 
         with (
+            patch.dict(os.environ, {"CODEX_TRANSPORT": "exec"}),
             patch.object(
                 bot.asyncio,
                 "create_subprocess_exec",

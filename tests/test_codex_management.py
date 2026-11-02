@@ -52,12 +52,12 @@ class CodexDoctorTests(unittest.TestCase):
 
 
 class CodexModelSelectionTests(unittest.TestCase):
-    def test_fallback_default_is_gpt_6_sol(self):
+    def test_fallback_default_is_gpt_6_1_sol(self):
         with (
             patch.dict(os.environ, {}, clear=True),
             patch.object(bot, "_read_codex_config", return_value={}),
         ):
-            self.assertEqual(bot._resolve_codex_model(), "gpt-6-sol")
+            self.assertEqual(bot._resolve_codex_model(), "gpt-6.1-sol")
 
     def test_default_model_is_selectable_before_cache_refresh(self):
         cache = {
@@ -71,12 +71,138 @@ class CodexModelSelectionTests(unittest.TestCase):
         }
         with (
             patch.object(bot, "_read_codex_models_cache", return_value=cache),
-            patch.object(bot, "_resolve_codex_model", return_value="gpt-6-sol"),
+            patch.object(bot, "_resolve_codex_model", return_value="gpt-6.1-sol"),
         ):
             values = [option["value"] for option in bot._codex_model_options()]
 
-        self.assertEqual(values[0], "gpt-6-sol")
+        self.assertEqual(values[0], "gpt-6.1-sol")
         self.assertIn("gpt-6-astra", values)
+
+    def test_gpt_6_alias_selects_current_sol(self):
+        cache = {
+            "models": [{
+                "slug": "gpt-6.1-sol",
+                "display_name": "GPT-6.1-Sol",
+                "description": "Current Sol model",
+                "visibility": "list",
+                "priority": 1,
+            }]
+        }
+        with patch.object(bot, "_read_codex_models_cache", return_value=cache):
+            self.assertEqual(
+                bot._find_select_model_option("gpt-6")["model"],
+                "gpt-6.1-sol",
+            )
+            self.assertEqual(
+                bot._find_select_model_option("gpt-6.1")["model"],
+                "gpt-6.1-sol",
+            )
+
+    def test_opus_5_5_aliases_select_claude_backend(self):
+        with patch.object(bot, "_read_codex_models_cache", return_value={"models": []}):
+            for name in ("claude-opus-5-5", "Claude Opus 5.5", "opus-5.5", "opus-5-5", "opus5.5"):
+                option = bot._find_select_model_option(name)
+                self.assertEqual(option["backend"], "claude")
+                self.assertEqual(option["model"], "claude-opus-5-5")
+
+
+class ClaudeEffortTests(unittest.IsolatedAsyncioTestCase):
+    CHANNEL = 123
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for patcher in (
+            patch.dict(bot.channel_backends, {self.CHANNEL: "claude"}),
+            patch.dict(bot.channel_claude_efforts, clear=True),
+            patch.object(bot, "CLAUDE_EFFORTS_FILE", os.path.join(self.tmp.name, "efforts.json")),
+            patch.dict(os.environ, {"CLAUDE_EFFORT_LEVEL": "high"}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_channel_selection_overrides_env_default_and_persists(self):
+        self.assertEqual(bot._resolve_claude_effort(self.CHANNEL), "high")
+
+        ok, _ = bot.apply_selected_reasoning(self.CHANNEL, "xhigh")
+
+        self.assertTrue(ok)
+        self.assertEqual(bot._resolve_claude_effort(self.CHANNEL), "xhigh")
+        self.assertEqual(bot._reasoning_display(self.CHANNEL), "xhigh (channel)")
+        with open(bot.CLAUDE_EFFORTS_FILE, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {str(self.CHANNEL): "xhigh"})
+
+    def test_default_clears_selection(self):
+        bot.apply_selected_reasoning(self.CHANNEL, "max")
+
+        ok, _ = bot.apply_selected_reasoning(self.CHANNEL, "default")
+
+        self.assertTrue(ok)
+        self.assertEqual(bot._reasoning_display(self.CHANNEL), "high (default)")
+
+    def test_rejects_level_claude_does_not_support(self):
+        ok, message = bot.apply_selected_reasoning(self.CHANNEL, "ultra")
+
+        self.assertFalse(ok)
+        self.assertIn("xhigh", message)
+        self.assertNotIn(self.CHANNEL, bot.channel_claude_efforts)
+
+    def test_options_list_claude_levels(self):
+        values = [option["value"] for option in bot._reasoning_options(self.CHANNEL)]
+
+        self.assertEqual(values, ["default", "low", "medium", "high", "xhigh", "max"])
+
+    def test_codex_channel_selection_stays_separate(self):
+        with patch.dict(bot.channel_backends, {self.CHANNEL: "codex"}), \
+                patch.dict(bot.channel_reasoning, clear=True), \
+                patch.object(bot, "save_codex_reasoning"), \
+                patch.object(bot, "_codex_supported_reasoning", return_value=[]):
+            ok, _ = bot.apply_selected_reasoning(self.CHANNEL, "ultra")
+
+            self.assertTrue(ok)
+            self.assertEqual(bot.channel_reasoning[self.CHANNEL], "ultra")
+        self.assertNotIn(self.CHANNEL, bot.channel_claude_efforts)
+
+    async def _spawn_args(self):
+        proc = AsyncMock()
+        proc.returncode = None
+        with patch.dict(bot.channel_models, clear=True), \
+                patch.dict(bot.channel_sessions, clear=True), \
+                patch.dict(bot.channel_claude_procs, clear=True), \
+                patch.dict(os.environ, {"CLAUDE_CODE_EFFORT_LEVEL": "low"}), \
+                patch.object(bot.asyncio, "create_subprocess_exec", new=AsyncMock(return_value=proc)) as spawn, \
+                patch.object(bot, "_stdout_reader", new=AsyncMock()), \
+                patch.object(bot, "_stderr_reader", new=AsyncMock()):
+            session = await bot.spawn_persistent_proc(self.CHANNEL, self.tmp.name)
+            session["reader_task"].cancel()
+            session["stderr_task"].cancel()
+        return spawn.call_args, session
+
+    async def test_spawn_passes_effort_and_drops_overriding_env(self):
+        bot.apply_selected_reasoning(self.CHANNEL, "xhigh")
+
+        call, session = await self._spawn_args()
+
+        args = list(call.args)
+        self.assertEqual(args[args.index("--effort") + 1], "xhigh")
+        self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", call.kwargs["env"])
+        self.assertEqual(session["effort"], "xhigh")
+
+    async def test_effort_change_respawns_on_next_message(self):
+        proc = AsyncMock()
+        proc.returncode = None
+        current = {"proc": proc, "work_dir": self.tmp.name, "effort": "high"}
+        replacement = {"proc": proc, "work_dir": self.tmp.name, "effort": "max"}
+        with patch.dict(bot.channel_claude_procs, {self.CHANNEL: current}), \
+                patch.object(bot, "kill_channel_proc", new=AsyncMock()) as kill, \
+                patch.object(bot, "spawn_persistent_proc", new=AsyncMock(return_value=replacement)):
+            self.assertIs(await bot.get_or_spawn_proc(self.CHANNEL, self.tmp.name), current)
+            kill.assert_not_awaited()
+
+            bot.apply_selected_reasoning(self.CHANNEL, "max")
+
+            self.assertIs(await bot.get_or_spawn_proc(self.CHANNEL, self.tmp.name), replacement)
+            kill.assert_awaited_once_with(self.CHANNEL)
 
 
 class PendingQueuePersistenceTests(unittest.TestCase):
