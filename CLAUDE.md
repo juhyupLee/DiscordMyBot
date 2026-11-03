@@ -35,6 +35,7 @@ Discord 메시지로 Claude Code CLI를 원격 실행하는 봇. 채널별 독�
 - stdout은 백그라운드 `_stdout_reader` 태스크가 계속 읽어 `asyncio.Queue`로 전달
 - 턴 완료는 `result` 이벤트 수신으로 판정 (프로세스는 유지)
 - 프로세스는 **봇 종료 전까지 계속 살아있음** (idle timeout 없음)
+- 유휴 압축: 컨텍스트 20만 토큰 이상인 채널이 55분간 요청이 없으면 `/compact`를 보내 1시간 프롬프트 캐시 만료 전에 요약 (데스크톱 앱의 idle compaction을 -p 모드에서 대신 수행, 기준은 `CLAUDE_IDLE_COMPACT_*` 상수)
 - work_dir 변경 시 프로세스 재생성 (cwd는 프로세스 시작 시 고정)
 - 이미지 있으면 `--add-dir`로 attachments 디렉토리 접근 허용
 - 턴당 타임아웃: 30분

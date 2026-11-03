@@ -108,6 +108,10 @@ CHANNEL_TOPIC_MARKER = "🤖 "  # 채널 토픽 첫 줄 중 봇이 관리하는 
 CHANNEL_TOPIC_SYNC_DELAY_SECONDS = 3  # 연달아 바꿀 때 한 번에 반영 (토픽 변경은 10분에 2회 제한)
 # Claude CLI rate_limit_event의 창 이름 → 창 길이(분)
 CLAUDE_RATE_LIMIT_WINDOWS = {"five_hour": 5 * 60, "seven_day": 7 * 24 * 60}
+# 데스크톱 앱의 유휴 압축과 같은 기준: 긴 대화를 1시간 프롬프트 캐시가 만료되기 전에 요약해 둔다
+# (-p 모드 CLI는 스스로 하지 않으므로, 쉬었다 보낸 메시지가 대화 전체를 캐시에 다시 쓰게 된다)
+CLAUDE_IDLE_COMPACT_AFTER_SECONDS = 55 * 60
+CLAUDE_IDLE_COMPACT_MIN_TOKENS = 200_000
 JSONL_MAX_LINE_BYTES = 64 * 1024 * 1024
 maintenance_restarting = False
 CODEX_USAGE_TOKEN_FIELDS = (
@@ -2468,6 +2472,7 @@ async def spawn_persistent_proc(channel_id: int, work_dir: str) -> dict:
         "carry": [],                # 자동 턴 감지용으로 먼저 읽은 이벤트
         "idle_task": None,          # 턴 사이 출력 감시 태스크
         "notify_channel": None,     # 자동 턴 결과를 보낼 채널
+        "context_tokens": 0,        # 마지막 요청의 컨텍스트 크기 (유휴 압축 판단용)
     }
     channel_claude_procs[channel_id] = session
     return session
@@ -2647,11 +2652,101 @@ def _start_claude_idle_watch(channel_id: int, session: dict):
     session["idle_task"] = asyncio.create_task(_claude_idle_watch(channel_id, session))
 
 
+def _note_claude_context_tokens(session: dict, data: dict):
+    """메인 대화의 assistant 이벤트에서 이번 요청의 컨텍스트 크기를 기록한다 (서브에이전트 제외)."""
+    if data.get("parent_tool_use_id"):
+        return
+    usage = (data.get("message") or {}).get("usage") or {}
+    total = sum(int(usage.get(key) or 0) for key in
+                ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    if total:
+        session["context_tokens"] = total
+
+
+def _claude_idle_compact_delay(session: dict, now: float | None = None) -> float | None:
+    """유휴 압축까지 남은 초. 대화가 짧으면 None (압축하지 않음)."""
+    if session.get("context_tokens", 0) < CLAUDE_IDLE_COMPACT_MIN_TOKENS:
+        return None
+    now = time.time() if now is None else now
+    return max(0.0, session.get("last_active", now) + CLAUDE_IDLE_COMPACT_AFTER_SECONDS - now)
+
+
+async def _claude_idle_compact(channel_id: int, session: dict, channel):
+    """캐시가 살아 있을 때 /compact를 보내 다음 메시지가 요약에서 이어지게 한다."""
+    before = session.get("context_tokens", 0)
+    channel_status[channel_id] = "🗜️ 오래 쉬어서 대화 요약 중..."
+    logger.info(f"채널 {channel_id}: 유휴 압축 시작 (컨텍스트 {before:,} 토큰)")
+    metadata = None
+    result = None
+    async with session["lock"]:
+        await send_user_message(session, "/compact")
+        while True:
+            data = session["carry"].pop(0) if session["carry"] else await session["event_queue"].get()
+            if data.get("__eof__"):
+                logger.warning(f"채널 {channel_id}: 유휴 압축 중 Claude 프로세스 종료 ({data.get('__error__', 'EOF')})")
+                return
+            msg_type = data.get("type")
+            if msg_type == "system" and data.get("subtype") == "compact_boundary":
+                metadata = data.get("compact_metadata") or {}
+            elif msg_type == "rate_limit_event" and _record_claude_rate_limit(data):
+                asyncio.create_task(_refresh_usage_presence())
+            elif msg_type == "result":
+                result = data
+                break
+
+    session["last_active"] = time.time()
+    # 압축 요청은 세션 기록(jsonl)에 사용량이 남지 않아, 프로세스 누적 비용의 차이로 기록한다
+    cost_note = ""
+    if result.get("total_cost_usd") is not None:
+        if session.get("total_cost_usd") is not None:
+            cost_note = f", 압축 비용 ${result['total_cost_usd'] - session['total_cost_usd']:.4f}"
+        session["total_cost_usd"] = result["total_cost_usd"]
+    if result.get("session_id"):
+        channel_sessions[channel_id] = result["session_id"]
+        session["session_id"] = result["session_id"]
+        save_sessions()
+    if metadata is None:
+        # 요약할 것이 없거나 실패 — 다음 사용자 턴 전까지 다시 시도하지 않는다
+        session["context_tokens"] = 0
+        logger.warning(f"채널 {channel_id}: 유휴 압축 안 됨 ({str(result.get('result') or '')[:200]})")
+    else:
+        # pre/post_tokens는 시스템 프롬프트·도구 정의를 뺀 대화 크기라 같은 기준으로 비교한다
+        before = int(metadata.get("pre_tokens") or before)
+        after = int(metadata.get("post_tokens") or 0)
+        session["context_tokens"] = after
+        logger.info(f"채널 {channel_id}: 유휴 압축 완료 ({before:,} → {after:,} 토큰{cost_note})")
+        if channel:
+            try:
+                await channel.send(
+                    f"🗜️ 오래 쉬어서 프롬프트 캐시가 만료되기 전에 대화를 요약해 뒀습니다 "
+                    f"({_compact_token_count(before)} → {_compact_token_count(after)} 토큰). "
+                    f"다음 메시지는 요약에서 이어집니다."
+                )
+            except Exception:
+                pass
+    if channel_claude_procs.get(channel_id) is session:
+        _start_claude_idle_watch(channel_id, session)
+
+
+async def _relay_claude_auto_turn(channel_id: int, session: dict, channel):
+    result = await _run_claude_once(None, session["work_dir"], channel_id,
+                                    status_channel=channel, auto_turn=True)
+    if channel and (result.startswith("오류") or result == "(빈 응답)"):
+        await channel.send(f"```\n{result}\n```")
+
+
 async def _claude_idle_watch(channel_id: int, session: dict):
-    """턴 사이에도 출력을 지켜보다가 Claude가 스스로 시작한 턴을 디스코드로 전달한다."""
+    """턴 사이에도 출력을 지켜보다가 Claude가 스스로 시작한 턴을 디스코드로 전달한다.
+
+    긴 대화가 오래 쉬고 있으면 캐시가 만료되기 전에 유휴 압축을 실행한다.
+    """
     queue: asyncio.Queue = session["event_queue"]
     while True:
-        data = await queue.get()
+        try:
+            data = await asyncio.wait_for(queue.get(), _claude_idle_compact_delay(session))
+        except asyncio.TimeoutError:
+            data = None
+            break
         if data.get("__eof__"):
             session["idle_task"] = None
             logger.info(f"채널 {channel_id}: 대기 중 Claude 프로세스 종료 ({data.get('__error__', 'EOF')})")
@@ -2661,28 +2756,32 @@ async def _claude_idle_watch(channel_id: int, session: dict):
         if data.get("type") == "rate_limit_event" and _record_claude_rate_limit(data):
             asyncio.create_task(_refresh_usage_presence())
 
-    # 여기부터는 자동 턴 — 사용자 턴이 시작돼도 취소되지 않게 감시 태스크에서 분리
+    # 여기부터는 자동 턴/유휴 압축 — 사용자 턴이 시작돼도 취소되지 않게 감시 태스크에서 분리
     session["idle_task"] = None
-    session["carry"].append(data)
+    if data is not None:
+        session["carry"].append(data)
     if channel_claude_procs.get(channel_id) is not session or session["lock"].locked():
         return
 
-    logger.info(f"채널 {channel_id}: Claude 자동 턴 감지, 디스코드로 전달")
     channel = session.get("notify_channel")
+    if data is None:
+        if channel_busy.get(channel_id):
+            return  # 사용자 턴이 곧 시작된다 — 끝난 뒤 감시가 다시 걸린다
+        work = _claude_idle_compact(channel_id, session, channel)
+    else:
+        logger.info(f"채널 {channel_id}: Claude 자동 턴 감지, 디스코드로 전달")
+        work = _relay_claude_auto_turn(channel_id, session, channel)
     owns_busy = not channel_busy.get(channel_id)
     current_task = asyncio.current_task()
     if owns_busy:
         channel_busy[channel_id] = True
         channel_tasks[channel_id] = current_task
     try:
-        result = await _run_claude_once(None, session["work_dir"], channel_id,
-                                        status_channel=channel, auto_turn=True)
-        if channel and (result.startswith("오류") or result == "(빈 응답)"):
-            await channel.send(f"```\n{result}\n```")
+        await work
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        logger.error(f"채널 {channel_id}: Claude 자동 턴 처리 오류: {e}", exc_info=True)
+        logger.error(f"채널 {channel_id}: Claude 턴 사이 작업 오류: {e}", exc_info=True)
     finally:
         if owns_busy:
             if channel_tasks.get(channel_id) is current_task:
@@ -3563,6 +3662,9 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
 
                     continue
 
+                if msg_type == "assistant":
+                    _note_claude_context_tokens(session, data)
+
                 # assistant: 완성된 메시지 (도구 상세 정보, AskUserQuestion 감지용)
                 if msg_type == "assistant" and status_channel:
                     for content in data.get("message", {}).get("content", []):
@@ -3646,6 +3748,9 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
                 if msg_type == "result":
                     result_text = data.get("result", "")
                     new_session_id = data.get("session_id")
+
+                    if data.get("total_cost_usd") is not None:
+                        session["total_cost_usd"] = data["total_cost_usd"]
 
                     if status_channel:
                         stats_parts = []

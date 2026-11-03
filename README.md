@@ -13,6 +13,7 @@ Discord 메시지로 [OpenAI Codex CLI](https://developers.openai.com/codex/cli/
 - **Codex 기본 모델**: `gpt-6.1-sol`; 채널별로 선택한 Astra·Luna 등은 그대로 유지하고 `/select-model`로 변경 가능
 - **실시간 진행 표시**: JSON 이벤트를 파싱해 도구 호출, 명령 실행, 파일 수정과 공개 중간 안내를 Discord에 누적 표시
 - **세션 지속**: Codex는 thread ID로 턴마다 재개하고, Claude는 채널당 장기 실행 프로세스로 문맥 유지
+- **Claude 유휴 압축**: 20만 토큰 이상인 대화가 55분간 쉬면 프롬프트 캐시가 만료되기 전에 `/compact`로 요약해, 쉬었다 보낸 메시지가 대화 전체를 캐시에 다시 쓰지 않게 함
 - **작업 시간 제한 없음**: 장시간 도구 실행도 자동 종료하지 않고 완료될 때까지 대기하며, 필요하면 `중지` 명령으로 직접 취소
 - **대용량 스트림 안전 처리**: Codex/Claude가 StreamReader 제한보다 큰 JSONL 한 줄을 출력해도 최대 64MB까지 청크로 복원하고 다음 이벤트를 계속 처리
 - **Codex 사용량 자동 재개**: 사용량 제한 시 작업·세션·첨부를 보관하고 공식 `resetsAt` 이후 자동 재개. 반복 실패하면 Claude가 읽기 전용 감독 점검
