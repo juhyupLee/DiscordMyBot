@@ -85,6 +85,7 @@ CLAUDE_EFFORTS_FILE = os.path.join(os.path.dirname(__file__), "channel_claude_ef
 CODEX_DEFERRED_FILE = os.path.join(os.path.dirname(__file__), "codex_deferred_jobs.json")
 CODEX_USAGE_FILE = os.path.join(os.path.dirname(__file__), "codex_usage_stats.json")
 CLAUDE_RATE_LIMITS_FILE = os.path.join(os.path.dirname(__file__), "claude_rate_limits.json")
+CLAUDE_IDLE_COMPACT_STATS_FILE = os.path.join(os.path.dirname(__file__), "claude_idle_compact_stats.json")
 CHANNEL_PENDING_FILE = os.path.join(os.path.dirname(__file__), "channel_pending_jobs.json")
 CODEX_MODELS_CACHE_FILE = os.getenv(
     "CODEX_MODELS_CACHE_FILE",
@@ -112,6 +113,10 @@ CLAUDE_RATE_LIMIT_WINDOWS = {"five_hour": 5 * 60, "seven_day": 7 * 24 * 60}
 # (-p 모드 CLI는 스스로 하지 않으므로, 쉬었다 보낸 메시지가 대화 전체를 캐시에 다시 쓰게 된다)
 CLAUDE_IDLE_COMPACT_AFTER_SECONDS = 55 * 60
 CLAUDE_IDLE_COMPACT_MIN_TOKENS = 200_000
+CLAUDE_PROMPT_CACHE_TTL_SECONDS = 60 * 60
+# 압축 효과 계산용, 입력 토큰 대비 가격 배율 (platform.claude.com 가격표, 2026-11 확인)
+CLAUDE_PRICE_WEIGHTS = {"input": 1.0, "cache_write_5m": 1.25, "cache_write_1h": 2.0, "cache_read": 0.1, "output": 5.0}
+CLAUDE_CACHE_READ_WEIGHTS = {"claude-opus-5-5": 0.05, "claude-sonnet-5-5": 0.05}
 JSONL_MAX_LINE_BYTES = 64 * 1024 * 1024
 maintenance_restarting = False
 CODEX_USAGE_TOKEN_FIELDS = (
@@ -452,6 +457,15 @@ try:
         _loaded = json.load(_f)
     if isinstance(_loaded, dict):
         claude_rate_limits.update(_loaded)
+except (OSError, json.JSONDecodeError):
+    pass
+# 유휴 압축 누적 효과: compactions, returns, net_saved_eq(입력 토큰 환산 순절약), compact_cost_usd
+claude_idle_compact_stats: dict = {}
+try:
+    with open(CLAUDE_IDLE_COMPACT_STATS_FILE, "r", encoding="utf-8") as _f:
+        _loaded = json.load(_f)
+    if isinstance(_loaded, dict):
+        claude_idle_compact_stats.update(_loaded)
 except (OSError, json.JSONDecodeError):
     pass
 usage_presence: dict = {"client": None, "text": None, "task": None}
@@ -2663,6 +2677,84 @@ def _note_claude_context_tokens(session: dict, data: dict):
         session["context_tokens"] = total
 
 
+def _claude_token_counts(usage: dict) -> dict:
+    """assistant 이벤트의 usage(snake_case)와 result의 modelUsage(camelCase)를 같은 키로 맞춘다."""
+    if "inputTokens" in usage or "outputTokens" in usage:
+        write_total = usage.get("cacheCreationInputTokens") or 0
+        write_1h = usage.get("cacheCreationEphemeral1hInputTokens") or 0
+        return {
+            "input": usage.get("inputTokens") or 0,
+            "cache_write_5m": usage.get("cacheCreationEphemeral5mInputTokens", write_total - write_1h) or 0,
+            "cache_write_1h": write_1h,
+            "cache_read": usage.get("cacheReadInputTokens") or 0,
+            "output": usage.get("outputTokens") or 0,
+        }
+    write_total = usage.get("cache_creation_input_tokens") or 0
+    write_1h = (usage.get("cache_creation") or {}).get("ephemeral_1h_input_tokens") or 0
+    return {
+        "input": usage.get("input_tokens") or 0,
+        "cache_write_5m": write_total - write_1h,
+        "cache_write_1h": write_1h,
+        "cache_read": usage.get("cache_read_input_tokens") or 0,
+        "output": usage.get("output_tokens") or 0,
+    }
+
+
+def _claude_weighted_tokens(model: str, counts: dict) -> float:
+    """입력 토큰 가격으로 환산한 토큰 수."""
+    weights = dict(CLAUDE_PRICE_WEIGHTS)
+    weights["cache_read"] = CLAUDE_CACHE_READ_WEIGHTS.get(model, weights["cache_read"])
+    return sum(counts.get(key, 0) * weight for key, weight in weights.items())
+
+
+def _claude_model_usage_totals(model_usage: dict | None) -> tuple[float, float]:
+    """result의 modelUsage(프로세스 누적)에서 입력 환산 토큰과 비용(USD) 합계."""
+    weighted = cost = 0.0
+    for model, usage in (model_usage or {}).items():
+        weighted += _claude_weighted_tokens(model, _claude_token_counts(usage))
+        cost += usage.get("costUSD") or 0
+    return weighted, cost
+
+
+def _save_claude_idle_compact_stats():
+    try:
+        with open(CLAUDE_IDLE_COMPACT_STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(claude_idle_compact_stats, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        logger.warning(f"유휴 압축 통계 저장 실패: {e}")
+
+
+def _settle_claude_idle_compact(session: dict, data: dict, now: float | None = None) -> str | None:
+    """압축 뒤 돌아와 보낸 첫 요청에서, 압축하지 않았을 때와 비교한 효과를 계산한다."""
+    pending = session.get("idle_compact_eval")
+    message = data.get("message") or {}
+    if not pending or data.get("parent_tool_use_id") or not message.get("usage"):
+        return None
+    session["idle_compact_eval"] = None
+    now = time.time() if now is None else now
+    model = message.get("model", "")
+    counts = _claude_token_counts(message["usage"])
+    counts["output"] = 0  # 출력은 압축 여부와 상관없다
+    returned = _claude_weighted_tokens(model, counts)
+    # 압축하지 않았다면 캐시가 만료된 뒤엔 대화 전체를 1시간 캐시에 다시 쓰고, 살아 있으면 읽기만 한다
+    expired = now - pending["pre_last_active"] >= CLAUDE_PROMPT_CACHE_TTL_SECONDS
+    without = _claude_weighted_tokens(
+        model, {"cache_write_1h" if expired else "cache_read": pending["pre_context"]})
+    saved = without - pending["compact_eq"] - returned
+
+    stats = claude_idle_compact_stats
+    stats["returns"] = stats.get("returns", 0) + 1
+    stats["net_saved_eq"] = stats.get("net_saved_eq", 0.0) + without - returned
+    _save_claude_idle_compact_stats()
+    net = stats["net_saved_eq"]
+    return (
+        f"🗜️ 유휴 압축 효과 (입력 토큰 환산 추정): 압축 안 했으면 {_compact_token_count(without)} → "
+        f"압축 {_compact_token_count(pending['compact_eq'])} + 복귀 {_compact_token_count(returned)}, "
+        f"{'절약' if saved >= 0 else '손해'} {_compact_token_count(abs(saved))} "
+        f"(누적 압축 {stats.get('compactions', 0)}회 순{'절약' if net >= 0 else '손해'} {_compact_token_count(abs(net))})"
+    )
+
+
 def _claude_idle_compact_delay(session: dict, now: float | None = None) -> float | None:
     """유휴 압축까지 남은 초. 대화가 짧으면 None (압축하지 않음)."""
     if session.get("context_tokens", 0) < CLAUDE_IDLE_COMPACT_MIN_TOKENS:
@@ -2673,7 +2765,8 @@ def _claude_idle_compact_delay(session: dict, now: float | None = None) -> float
 
 async def _claude_idle_compact(channel_id: int, session: dict, channel):
     """캐시가 살아 있을 때 /compact를 보내 다음 메시지가 요약에서 이어지게 한다."""
-    before = session.get("context_tokens", 0)
+    before = context_before = session.get("context_tokens", 0)
+    last_active_before = session.get("last_active", time.time())
     channel_status[channel_id] = "🗜️ 오래 쉬어서 대화 요약 중..."
     logger.info(f"채널 {channel_id}: 유휴 압축 시작 (컨텍스트 {before:,} 토큰)")
     metadata = None
@@ -2695,12 +2788,14 @@ async def _claude_idle_compact(channel_id: int, session: dict, channel):
                 break
 
     session["last_active"] = time.time()
-    # 압축 요청은 세션 기록(jsonl)에 사용량이 남지 않아, 프로세스 누적 비용의 차이로 기록한다
-    cost_note = ""
-    if result.get("total_cost_usd") is not None:
-        if session.get("total_cost_usd") is not None:
-            cost_note = f", 압축 비용 ${result['total_cost_usd'] - session['total_cost_usd']:.4f}"
-        session["total_cost_usd"] = result["total_cost_usd"]
+    # 압축 요청은 세션 기록(jsonl)에 사용량이 남지 않아, 프로세스 누적 사용량(modelUsage)의 차이로 구한다
+    compact_eq = compact_cost = None
+    if result.get("modelUsage"):
+        if session.get("model_usage"):
+            prev_eq, prev_cost = _claude_model_usage_totals(session["model_usage"])
+            new_eq, new_cost = _claude_model_usage_totals(result["modelUsage"])
+            compact_eq, compact_cost = new_eq - prev_eq, new_cost - prev_cost
+        session["model_usage"] = result["modelUsage"]
     if result.get("session_id"):
         channel_sessions[channel_id] = result["session_id"]
         session["session_id"] = result["session_id"]
@@ -2714,6 +2809,19 @@ async def _claude_idle_compact(channel_id: int, session: dict, channel):
         before = int(metadata.get("pre_tokens") or before)
         after = int(metadata.get("post_tokens") or 0)
         session["context_tokens"] = after
+        cost_note = ""
+        if compact_eq is not None:
+            cost_note = f", 압축 비용 입력 환산 {compact_eq:,.0f} 토큰 / ${compact_cost:.4f}"
+            session["idle_compact_eval"] = {
+                "pre_context": context_before,
+                "pre_last_active": last_active_before,
+                "compact_eq": compact_eq,
+            }
+            stats = claude_idle_compact_stats
+            stats["compactions"] = stats.get("compactions", 0) + 1
+            stats["net_saved_eq"] = stats.get("net_saved_eq", 0.0) - compact_eq
+            stats["compact_cost_usd"] = stats.get("compact_cost_usd", 0.0) + compact_cost
+            _save_claude_idle_compact_stats()
         logger.info(f"채널 {channel_id}: 유휴 압축 완료 ({before:,} → {after:,} 토큰{cost_note})")
         if channel:
             try:
@@ -3507,6 +3615,7 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
             EDIT_INTERVAL = 1.0        # 최소 edit 간격 (초)
             result_text = ""
             is_thinking = False        # thinking 블록 진행 중 여부
+            compact_report = None      # 유휴 압축 뒤 첫 턴이면 압축 효과 보고
 
             if status_channel:
                 processing_text = (
@@ -3664,6 +3773,7 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
 
                 if msg_type == "assistant":
                     _note_claude_context_tokens(session, data)
+                    compact_report = _settle_claude_idle_compact(session, data) or compact_report
 
                 # assistant: 완성된 메시지 (도구 상세 정보, AskUserQuestion 감지용)
                 if msg_type == "assistant" and status_channel:
@@ -3749,8 +3859,8 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
                     result_text = data.get("result", "")
                     new_session_id = data.get("session_id")
 
-                    if data.get("total_cost_usd") is not None:
-                        session["total_cost_usd"] = data["total_cost_usd"]
+                    if data.get("modelUsage"):
+                        session["model_usage"] = data["modelUsage"]
 
                     if status_channel:
                         stats_parts = []
@@ -3774,6 +3884,14 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
                         if stats_parts:
                             try:
                                 await status_channel.send(" ".join(stats_parts))
+                            except Exception:
+                                pass
+
+                    if compact_report:
+                        logger.info(f"채널 {channel_id}: {compact_report}")
+                        if status_channel:
+                            try:
+                                await status_channel.send(compact_report)
                             except Exception:
                                 pass
 

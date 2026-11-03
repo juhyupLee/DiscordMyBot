@@ -1,4 +1,6 @@
 import asyncio
+import os
+import tempfile
 import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -6,6 +8,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import bot
 
 CHANNEL = 4343
+
+# result의 modelUsage는 프로세스 누적값 — 압축 전후 차이가 압축 요청의 사용량이다
+USAGE_BEFORE = {"claude-opus-5-5": {
+    "inputTokens": 10, "outputTokens": 1_000, "cacheReadInputTokens": 500_000,
+    "cacheCreationInputTokens": 300_000, "cacheCreationEphemeral5mInputTokens": 0,
+    "cacheCreationEphemeral1hInputTokens": 300_000, "costUSD": 3.0}}
+USAGE_AFTER = {"claude-opus-5-5": {
+    "inputTokens": 2_010, "outputTokens": 16_000, "cacheReadInputTokens": 800_000,
+    "cacheCreationInputTokens": 310_000, "cacheCreationEphemeral5mInputTokens": 10_000,
+    "cacheCreationEphemeral1hInputTokens": 300_000, "costUSD": 3.5}}
+# 2,000 + 15,000×5 + 300,000×0.05 + 10,000×1.25
+COMPACT_EQ = 104_500
 
 
 def _message():
@@ -49,7 +63,7 @@ def _compact_events(post_tokens: int) -> list[dict]:
             "trigger": "manual", "pre_tokens": 300_000, "post_tokens": post_tokens}},
         {"type": "user", "message": {"role": "user", "content": "This session is being continued..."}},
         {"type": "user", "isReplay": True, "message": {"content": "<local-command-stdout>Compacted </local-command-stdout>"}},
-        {"type": "result", "subtype": "success", "result": "", "session_id": "sess-1", "total_cost_usd": 1.25},
+        {"type": "result", "subtype": "success", "result": "", "session_id": "sess-1", "modelUsage": USAGE_AFTER},
     ]
 
 
@@ -59,7 +73,11 @@ def _sent_texts(channel) -> list[str]:
 
 class ClaudeIdleCompactTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         for patcher in (
+            patch.dict(bot.claude_idle_compact_stats, clear=True),
+            patch.object(bot, "CLAUDE_IDLE_COMPACT_STATS_FILE", os.path.join(self.tmp.name, "stats.json")),
             patch.dict(bot.channel_claude_procs, clear=True),
             patch.dict(bot.channel_busy, clear=True),
             patch.dict(bot.channel_tasks, clear=True),
@@ -114,7 +132,7 @@ class ClaudeIdleCompactTests(unittest.IsolatedAsyncioTestCase):
     async def test_long_idle_conversation_is_compacted_before_cache_expires(self):
         channel = _channel()
         session = _session(channel, context_tokens=300_000)
-        session["total_cost_usd"] = 1.0
+        session["model_usage"] = USAGE_BEFORE
 
         async def send(sess, content):
             for event in _compact_events(40_000):
@@ -128,9 +146,13 @@ class ClaudeIdleCompactTests(unittest.IsolatedAsyncioTestCase):
         sent.assert_awaited_once()
         self.assertEqual(sent.await_args.args[1], "/compact")
         self.assertTrue(any("300k → 40k" in text for text in _sent_texts(channel)))
-        # 압축 요청 비용은 프로세스 누적 비용의 차이로 로그에 남는다
-        self.assertTrue(any("압축 비용 $0.2500" in str(call.args[0]) for call in info.call_args_list))
-        self.assertEqual(session["total_cost_usd"], 1.25)
+        # 압축 요청의 사용량은 프로세스 누적 사용량의 차이로 로그와 통계에 남는다
+        self.assertTrue(any("압축 비용 입력 환산 104,500 토큰 / $0.5000" in str(call.args[0])
+                            for call in info.call_args_list))
+        self.assertEqual(bot.claude_idle_compact_stats["compactions"], 1)
+        self.assertEqual(bot.claude_idle_compact_stats["net_saved_eq"], -COMPACT_EQ)
+        self.assertEqual(session["idle_compact_eval"]["pre_context"], 300_000)
+        self.assertTrue(os.path.exists(bot.CLAUDE_IDLE_COMPACT_STATS_FILE))
         # 요약된 대화는 다시 압축하지 않고, 자동 턴 감시는 계속된다
         self.assertIsNotNone(session["idle_task"])
         self.assertIsNone(bot._claude_idle_compact_delay(session))
@@ -217,6 +239,69 @@ class ClaudeIdleCompactTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(session["context_tokens"], 322_003)
             # 턴이 끝나면 55분 뒤 압축을 기다리는 감시가 걸린다
             self.assertGreater(bot._claude_idle_compact_delay(session), 3000)
+
+
+    def _pending(self, session, idle_seconds, now):
+        session["idle_compact_eval"] = {"pre_context": 300_000, "pre_last_active": now - idle_seconds,
+                                        "compact_eq": COMPACT_EQ}
+        bot.claude_idle_compact_stats.update({"compactions": 1, "net_saved_eq": -COMPACT_EQ})
+
+    @staticmethod
+    def _return_request(cache_write_1h=45_000, cache_read=0, parent=None):
+        return {"type": "assistant", "parent_tool_use_id": parent, "message": {
+            "model": "claude-opus-5-5",
+            "usage": {"input_tokens": 5, "cache_creation_input_tokens": cache_write_1h,
+                      "cache_creation": {"ephemeral_1h_input_tokens": cache_write_1h},
+                      "cache_read_input_tokens": cache_read, "output_tokens": 800}}}
+
+    def test_return_after_cache_expiry_reports_saving(self):
+        now = 1_000_000.0
+        session = _session()
+        self._pending(session, idle_seconds=4_000, now=now)
+
+        report = bot._settle_claude_idle_compact(session, self._return_request(), now=now)
+
+        # 압축 안 했으면 30만 토큰을 1시간 캐시에 다시 씀(×2) vs 압축 104.5k + 요약 4.5만 다시 씀(×2)
+        self.assertIn("압축 안 했으면 600k → 압축 104.5k + 복귀 90k, 절약 405.5k", report)
+        self.assertIn("누적 압축 1회 순절약 405.5k", report)
+        self.assertEqual(bot.claude_idle_compact_stats["returns"], 1)
+        self.assertIsNone(session["idle_compact_eval"])
+        # 한 번만 계산한다
+        self.assertIsNone(bot._settle_claude_idle_compact(session, self._return_request(), now=now))
+
+    def test_quick_return_counts_as_loss(self):
+        now = 1_000_000.0
+        session = _session()
+        # 캐시가 아직 살아 있을 때 돌아왔다면 압축하지 않았어도 읽기만 하면 됐다
+        self._pending(session, idle_seconds=3_400, now=now)
+
+        report = bot._settle_claude_idle_compact(session, self._return_request(0, 40_000), now=now)
+
+        self.assertIn("압축 안 했으면 15k → 압축 104.5k + 복귀 2k, 손해 91.5k", report)
+        self.assertIn("순손해", report)
+
+    def test_subagent_request_does_not_settle(self):
+        session = _session()
+        self._pending(session, idle_seconds=4_000, now=time.time())
+
+        self.assertIsNone(bot._settle_claude_idle_compact(session, self._return_request(parent="toolu_1")))
+        self.assertIsNotNone(session["idle_compact_eval"])
+
+    async def test_first_turn_after_compaction_posts_report(self):
+        channel = _channel()
+        session = _session(channel)
+        self._pending(session, idle_seconds=4_000, now=time.time())
+
+        async def send(sess, content):
+            for event in [self._return_request(),
+                          {"type": "result", "result": "답", "session_id": "sess-1", "modelUsage": USAGE_AFTER}]:
+                sess["event_queue"].put_nowait(event)
+
+        with patch.object(bot, "get_or_spawn_proc", new=AsyncMock(return_value=session)),                 patch.object(bot, "send_user_message", new=AsyncMock(side_effect=send)),                 patch.object(bot, "CLAUDE_IDLE_COMPACT_AFTER_SECONDS", 3300):
+            await bot._run_claude_once("이어서", "C:/repo", CHANNEL, status_channel=channel)
+
+        self.assertTrue(any(text.startswith("🗜️ 유휴 압축 효과") for text in _sent_texts(channel)))
+        self.assertEqual(session["model_usage"], USAGE_AFTER)
 
 
 if __name__ == "__main__":

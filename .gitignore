@@ -13,6 +13,7 @@ channel_claude_efforts.json
 codex_deferred_jobs.json
 codex_usage_stats.json
 claude_rate_limits.json
+claude_idle_compact_stats.json
 channel_pending_jobs.json
 scheduled_jobs.json
 .bot_running
