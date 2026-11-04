@@ -117,6 +117,15 @@ CLAUDE_PROMPT_CACHE_TTL_SECONDS = 60 * 60
 # 압축 효과 계산용, 입력 토큰 대비 가격 배율 (platform.claude.com 가격표, 2026-11 확인)
 CLAUDE_PRICE_WEIGHTS = {"input": 1.0, "cache_write_5m": 1.25, "cache_write_1h": 2.0, "cache_read": 0.1, "output": 5.0}
 CLAUDE_CACHE_READ_WEIGHTS = {"claude-opus-5-5": 0.05, "claude-sonnet-5-5": 0.05}
+# 데스크톱 앱은 별도 작업을 하위 세션 카드로 먼저 묻지만 -p 모드에는 그 도구가 없어 백그라운드
+# 서브에이전트로 바로 간다. 디스코드에서는 도는 에이전트가 보이지도 않으므로 띄우기 전에 묻게 한다.
+CLAUDE_APPEND_SYSTEM_PROMPT = (
+    "이 대화는 디스코드 봇을 거쳐 진행되며, 사용자는 백그라운드 서브에이전트가 도는 것을 볼 수 없다. "
+    "구현·수정·빌드·검증처럼 오래 걸릴 작업을 백그라운드 서브에이전트(Agent 도구의 run_in_background)로 "
+    "돌리기 전에는, 사용자가 요청한 작업을 나눠 돌리는 경우라도 무엇을 몇 개 띄울지 한두 줄로 알리고 "
+    "사용자의 답을 받은 뒤에 시작한다. 사용자가 이 대화에서 백그라운드나 병렬 작업을 직접 요청했으면 묻지 않는다. "
+    "이번 턴 안에 결과를 받아 쓰는 짧은 조사·검색용 서브에이전트는 묻지 않고 써도 된다."
+)
 JSONL_MAX_LINE_BYTES = 64 * 1024 * 1024
 maintenance_restarting = False
 CODEX_USAGE_TOKEN_FIELDS = (
@@ -2430,6 +2439,7 @@ async def spawn_persistent_proc(channel_id: int, work_dir: str) -> dict:
         "--verbose",
         "--add-dir", ATTACH_DIR,
         "--add-dir", os.path.expanduser("~/.claude"),
+        "--append-system-prompt", CLAUDE_APPEND_SYSTEM_PROMPT,
     ]
 
     session_id = channel_sessions.get(channel_id)

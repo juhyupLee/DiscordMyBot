@@ -29,7 +29,8 @@ Discord 메시지로 Claude Code CLI를 원격 실행하는 봇. 채널별 독�
 
 ### Claude CLI 호출 (persistent 모드)
 - 경로: `~/.local/bin/claude.exe` (환경변수 `CLAUDE_PATH`로 변경 가능)
-- 플래그: `--dangerously-skip-permissions -p --input-format stream-json --output-format stream-json --include-partial-messages --verbose`
+- 플래그: `--dangerously-skip-permissions -p --input-format stream-json --output-format stream-json --include-partial-messages --verbose --append-system-prompt <CLAUDE_APPEND_SYSTEM_PROMPT>`
+- 서브에이전트 확인 규칙: 데스크톱 앱은 별도 작업을 하위 세션 카드로 먼저 묻지만 -p 모드에는 그 도구가 없으므로, 오래 걸릴 백그라운드 서브에이전트를 띄우기 전에 사용자에게 묻도록 `CLAUDE_APPEND_SYSTEM_PROMPT`를 덧붙임 (짧은 조사용 서브에이전트와 사용자가 병렬을 직접 요청한 경우는 제외)
 - **채널당 장기 실행 프로세스 1개** 유지 (매 메시지마다 spawn 안 함)
 - user 메시지는 stdin에 JSON 라인으로 전송: `{"type":"user","message":{"role":"user","content":"..."}}`
 - stdout은 백그라운드 `_stdout_reader` 태스크가 계속 읽어 `asyncio.Queue`로 전달

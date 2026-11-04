@@ -188,6 +188,15 @@ class ClaudeEffortTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", call.kwargs["env"])
         self.assertEqual(session["effort"], "xhigh")
 
+    async def test_spawn_asks_before_background_subagents(self):
+        call, _ = await self._spawn_args()
+
+        args = list(call.args)
+        prompt = args[args.index("--append-system-prompt") + 1]
+        self.assertEqual(prompt, bot.CLAUDE_APPEND_SYSTEM_PROMPT)
+        self.assertIn("run_in_background", prompt)
+        self.assertNotIn("\n", prompt)
+
     async def test_effort_change_respawns_on_next_message(self):
         proc = AsyncMock()
         proc.returncode = None
