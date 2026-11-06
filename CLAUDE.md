@@ -5,7 +5,8 @@ Discord 메시지로 Claude Code CLI를 원격 실행하는 봇. 채널별 독�
 ## 구조
 
 - `bot.py` — 봇 전체 로직 (단일 파일)
-- `.env` — 환경변수 (TOKEN, ALLOWED_USER_ID, WORKING_DIR, CLAUDE_CATEGORY_ID)
+- `.env` — 환경변수 (TOKEN, ALLOWED_USER_ID, WORKING_DIR, CLAUDE_CATEGORY_ID, CLAUDE_UPDATE_CHANNEL_ID)
+- `claude_update_state.json` — 새벽 Claude CLI 업데이트의 마지막 시도 날짜·버전·결과
 - `channel_workdirs.json` — 채널별 작업 디렉토리 (재시작 후에도 유지)
 - `channel_sessions.json` — 채널별 Claude 세션 ID (재시작 후에도 유지)
 - `attachments/` — Discord 이미지 첨부파일 로컬 저장소
@@ -29,7 +30,8 @@ Discord 메시지로 Claude Code CLI를 원격 실행하는 봇. 채널별 독�
 
 ### Claude CLI 호출 (persistent 모드)
 - 경로: `~/.local/bin/claude.exe` (환경변수 `CLAUDE_PATH`로 변경 가능)
-- 플래그: `--dangerously-skip-permissions -p --input-format stream-json --output-format stream-json --include-partial-messages --verbose --append-system-prompt <CLAUDE_APPEND_SYSTEM_PROMPT>`
+- 플래그: `--dangerously-skip-permissions -p --input-format stream-json --output-format stream-json --include-partial-messages --verbose --chrome --append-system-prompt <CLAUDE_APPEND_SYSTEM_PROMPT>`
+- 크롬 제어: -p 모드는 `/chrome`의 "기본 켜기" 설정(`claudeInChromeDefaultEnabled`)을 따르지 않으므로 `--chrome`으로 직접 켬 (claude-in-chrome MCP 도구 22개, 컨텍스트 약 2.4천 토큰 증가)
 - 서브에이전트 확인 규칙: 데스크톱 앱은 별도 작업을 하위 세션 카드로 먼저 묻지만 -p 모드에는 그 도구가 없으므로, 오래 걸릴 백그라운드 서브에이전트를 띄우기 전에 사용자에게 묻도록 `CLAUDE_APPEND_SYSTEM_PROMPT`를 덧붙임 (짧은 조사용 서브에이전트와 사용자가 병렬을 직접 요청한 경우는 제외)
 - **채널당 장기 실행 프로세스 1개** 유지 (매 메시지마다 spawn 안 함)
 - user 메시지는 stdin에 JSON 라인으로 전송: `{"type":"user","message":{"role":"user","content":"..."}}`
@@ -43,6 +45,14 @@ Discord 메시지로 Claude Code CLI를 원격 실행하는 봇. 채널별 독�
 - Windows에서 `CREATE_NO_WINDOW`로 GUI 창 방지
 - stdout 버퍼: `limit=1024*1024` (큰 JSON 라인 처리)
 - Unity 빌드용 환경변수 자동 전달: `ANDROID_HOME`, `JAVA_HOME`
+
+### Claude CLI 매일 업데이트
+- 네이티브 설치 CLI는 스스로 업데이트하지 않으므로, 봇이 매일 05:00~07:30(`CLAUDE_UPDATE_WINDOW`, 최근 기록상 아무도 안 쓰는 시간) 사이 하루 한 번 `claude update`를 실행
+- 업데이터가 실행 중인 `claude.exe`를 `.old.<ts>`로 옮기고 새 파일을 깔기 때문에 채널 프로세스를 끄지 않아도 됨 (2026-11-06 확인)
+- 버전이 오르면 `claude_cli_generation`을 올려, 이전 버전으로 뜬 채널 프로세스는 다음 메시지 때 `--resume`으로 다시 띄움 (봇 재시작 불필요)
+- `CLAUDE_UPDATE_CHANNEL_ID` 채널에 결과를 알리고, 올랐으면 1분 뒤 1회 예약 작업으로 CHANGELOG 검토(`CLAUDE_UPDATE_REVIEW_PROMPT`)를 맡김. 봇에 반영할 변경은 제안만 하고 사용자가 그 채널에서 승인하면 반영
+- 최신이면 로그만 남기고, 실패하면 출력 끝부분을 채널에 알림. 실패해도 같은 날은 다시 시도하지 않음
+- 업데이트 결과와 상관없이 `claude auth status`의 `loginExpiresAt`을 읽어, claude.ai 로그인 만료가 `CLAUDE_LOGIN_WARN_DAYS`(10일) 안이거나 로그아웃·확인 실패면 같은 채널에 알림 (`-p`의 만료 경고는 text 출력 stderr에만 나와 stream-json 봇에는 안 보임, 2.1.318부터). 마지막 만료일은 `claude_update_state.json`의 `login_expires_at`
 
 ### 스트리밍 상태 표시
 - `stream-json` 출력을 실시간 파싱하여 Discord에 현재 작업 상태 표시

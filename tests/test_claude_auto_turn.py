@@ -139,6 +139,25 @@ class ClaudeAutoTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "사용자 질문에 대한 답")
         self.assertTrue(watcher.cancelled())
 
+    async def test_failed_resume_does_not_save_stale_session(self):
+        channel = _channel()
+        session = _session(channel)
+        bot.channel_claude_procs[CHANNEL] = session
+
+        async def send(sess, content):
+            # 대화를 못 찾은 CLI가 내보내는 실제 result (한 턴도 돌지 않음)
+            sess["event_queue"].put_nowait({
+                "type": "result", "subtype": "error_during_execution", "is_error": True,
+                "num_turns": 0, "session_id": "stale-session",
+            })
+
+        with patch.object(bot, "get_or_spawn_proc", new=AsyncMock(return_value=session)), \
+                patch.object(bot, "send_user_message", new=AsyncMock(side_effect=send)):
+            result = await bot._run_claude_once("질문", "C:/repo", CHANNEL, status_channel=channel)
+
+        self.assertTrue(result.startswith("오류 발생"))
+        self.assertNotIn(CHANNEL, bot.channel_sessions)
+
     async def test_user_turn_waits_for_running_auto_turn(self):
         channel = _channel()
         session = _session(channel)

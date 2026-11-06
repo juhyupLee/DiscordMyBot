@@ -38,6 +38,8 @@ ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
 WORKING_DIR = os.getenv("WORKING_DIR", os.getcwd())
 CLAUDE_CATEGORY_ID = int(os.getenv("CLAUDE_CATEGORY_ID", "0"))
 CLAUDE_PATH = os.getenv("CLAUDE_PATH", os.path.expanduser(r"~\.local\bin\claude.exe"))
+# 매일 새벽 Claude CLI 업데이트 결과와 변경점 검토를 올릴 채널 (0이면 로그만 남김)
+CLAUDE_UPDATE_CHANNEL_ID = int(os.getenv("CLAUDE_UPDATE_CHANNEL_ID", "0"))
 DEFAULT_BACKEND = os.getenv("DEFAULT_BACKEND", "codex").strip().lower()
 if DEFAULT_BACKEND not in ("claude", "codex"):
     DEFAULT_BACKEND = "codex"
@@ -87,6 +89,7 @@ CODEX_USAGE_FILE = os.path.join(os.path.dirname(__file__), "codex_usage_stats.js
 CLAUDE_RATE_LIMITS_FILE = os.path.join(os.path.dirname(__file__), "claude_rate_limits.json")
 CLAUDE_IDLE_COMPACT_STATS_FILE = os.path.join(os.path.dirname(__file__), "claude_idle_compact_stats.json")
 CHANNEL_PENDING_FILE = os.path.join(os.path.dirname(__file__), "channel_pending_jobs.json")
+CLAUDE_UPDATE_STATE_FILE = os.path.join(os.path.dirname(__file__), "claude_update_state.json")
 CODEX_MODELS_CACHE_FILE = os.getenv(
     "CODEX_MODELS_CACHE_FILE",
     os.path.join(os.path.expanduser("~"), ".codex", "models_cache.json"),
@@ -125,6 +128,23 @@ CLAUDE_APPEND_SYSTEM_PROMPT = (
     "돌리기 전에는, 사용자가 요청한 작업을 나눠 돌리는 경우라도 무엇을 몇 개 띄울지 한두 줄로 알리고 "
     "사용자의 답을 받은 뒤에 시작한다. 사용자가 이 대화에서 백그라운드나 병렬 작업을 직접 요청했으면 묻지 않는다. "
     "이번 턴 안에 결과를 받아 쓰는 짧은 조사·검색용 서브에이전트는 묻지 않고 써도 된다."
+)
+# 네이티브 설치 CLI는 스스로 업데이트하지 않아, 아무도 쓰지 않는 새벽(최근 기록상 04~06시)에 하루 한 번
+# `claude update`를 돌린다. 봇이 이 시간에 꺼져 있었으면 마감 전까지는 켜지는 대로 돌린다.
+# 업데이트는 파일을 바꿔치기할 뿐이라 실행 중인 채널 프로세스는 옛 버전으로 계속 돌고,
+# 각 채널은 다음 메시지 때 새 버전으로 다시 띄운다 (몇 시간 쉰 뒤라 프롬프트 캐시도 이미 식어 있다).
+CLAUDE_UPDATE_WINDOW = ("05:00", "07:30")
+CLAUDE_UPDATE_TIMEOUT_SECONDS = 10 * 60
+# 새벽 업데이트 때 claude.ai 로그인 만료가 이 일수 안이면 알림 (CLI의 -p 경고 기준과 같음)
+CLAUDE_LOGIN_WARN_DAYS = 10
+CLAUDE_UPDATE_REVIEW_PROMPT = (
+    "봇이 새벽 점검에서 Claude Code CLI를 {before}에서 {after}로 업데이트했다. "
+    "공식 CHANGELOG(https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md)에서 "
+    "{before} 다음 버전부터 {after}까지의 항목을 읽고, 이 디스코드 봇(bot.py)이 CLI를 쓰는 방식, "
+    "즉 -p와 stream-json 입출력, --resume, --effort·--model, --chrome, --append-system-prompt, "
+    "/compact 유휴 압축, 자동 턴·서브에이전트 이벤트, rate_limit_event에 영향을 주는 변경만 골라 한국어로 짧게 보고해. "
+    "봇에 반영하면 좋은 변경이 있으면 무엇을 왜 바꿀지 제안만 하고, 코드 수정·커밋·봇 재시작은 "
+    "사용자가 이 채널에서 승인한 뒤에 해. 관련 변경이 없으면 '봇에 반영할 변경 없음'과 주요 변경 한두 줄만 적어."
 )
 JSONL_MAX_LINE_BYTES = 64 * 1024 * 1024
 maintenance_restarting = False
@@ -477,6 +497,18 @@ try:
         claude_idle_compact_stats.update(_loaded)
 except (OSError, json.JSONDecodeError):
     pass
+# 새벽 CLI 업데이트: last_date(마지막으로 시도한 날), before/after 버전, 결과
+claude_update_state: dict = {}
+try:
+    with open(CLAUDE_UPDATE_STATE_FILE, "r", encoding="utf-8") as _f:
+        _loaded = json.load(_f)
+    if isinstance(_loaded, dict):
+        claude_update_state.update(_loaded)
+except (OSError, json.JSONDecodeError):
+    pass
+claude_update_task: asyncio.Task | None = None
+# CLI가 업데이트될 때마다 올린다. 이전 세대로 띄운 채널 프로세스는 다음 메시지 때 다시 띄운다.
+claude_cli_generation = 0
 usage_presence: dict = {"client": None, "text": None, "task": None}
 channel_topic_sync: dict = {"task": None, "dirty": False, "error": None}
 # 채널별 실제 Claude 모델: (설정값, CLI init 이벤트의 모델) — 설정이 바뀌면 다음 턴까지 설정값을 보여준다
@@ -2437,6 +2469,8 @@ async def spawn_persistent_proc(channel_id: int, work_dir: str) -> dict:
         "--output-format", "stream-json",
         "--include-partial-messages",
         "--verbose",
+        # -p 모드는 /chrome의 '기본 켜기' 설정을 따르지 않아 데스크톱처럼 크롬을 쓰려면 직접 켜야 한다
+        "--chrome",
         "--add-dir", ATTACH_DIR,
         "--add-dir", os.path.expanduser("~/.claude"),
         "--append-system-prompt", CLAUDE_APPEND_SYSTEM_PROMPT,
@@ -2486,6 +2520,7 @@ async def spawn_persistent_proc(channel_id: int, work_dir: str) -> dict:
         "proc": proc,
         "work_dir": work_dir,
         "effort": effort,
+        "cli_generation": claude_cli_generation,
         "reader_task": reader_task,
         "stderr_task": stderr_task,
         "stderr_buffer": stderr_buffer,
@@ -2617,7 +2652,7 @@ async def _stop_channel_codex_run(channel_id: int) -> bool:
 
 
 async def get_or_spawn_proc(channel_id: int, work_dir: str) -> dict:
-    """기존 세션 반환 또는 신규 생성. 프로세스 죽었거나 work_dir/effort 변경 시 재생성."""
+    """기존 세션 반환 또는 신규 생성. 프로세스 죽었거나 work_dir/effort/CLI 버전 변경 시 재생성."""
     session = channel_claude_procs.get(channel_id)
     if session:
         proc = session["proc"]
@@ -2631,6 +2666,10 @@ async def get_or_spawn_proc(channel_id: int, work_dir: str) -> dict:
             session = None
         elif session.get("effort") != _resolve_claude_effort(channel_id):
             logger.info(f"채널 {channel_id}: effort 변경, 재생성 ({session.get('effort')} → {_resolve_claude_effort(channel_id)})")
+            await kill_channel_proc(channel_id)
+            session = None
+        elif session.get("cli_generation", 0) != claude_cli_generation:
+            logger.info(f"채널 {channel_id}: Claude CLI 업데이트됨, 새 버전으로 재생성")
             await kill_channel_proc(channel_id)
             session = None
 
@@ -3868,6 +3907,12 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
                 if msg_type == "result":
                     result_text = data.get("result", "")
                     new_session_id = data.get("session_id")
+                    # --resume할 대화가 없으면 한 턴도 돌지 않은 오류 result가 그 ID를 그대로 싣고 온다.
+                    # 다시 저장하면 매번 같은 ID로 실패하므로 버리고, 오류로 돌려 새 대화로 재시도하게 한다.
+                    if data.get("is_error") and not data.get("num_turns"):
+                        new_session_id = None
+                        if not result_text:
+                            result_text = f"오류 발생: Claude 실행 실패 ({data.get('subtype') or 'result 오류'})"
 
                     if data.get("modelUsage"):
                         session["model_usage"] = data["modelUsage"]
@@ -4750,6 +4795,153 @@ async def _installed_stable_codex_version() -> tuple[int, int, int]:
     return tuple(int(part) for part in match.groups())
 
 
+async def _installed_claude_version() -> tuple[int, int, int]:
+    output = await _maintenance_probe([CLAUDE_PATH, "--version"])
+    match = re.match(r"(\d+)\.(\d+)\.(\d+) \(Claude Code\)", output)
+    if not match:
+        raise ValueError(f"Claude Code 버전을 읽지 못함: {output[:80]}")
+    return tuple(int(part) for part in match.groups())
+
+
+async def _run_claude_update_command() -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        CLAUDE_PATH, "update", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=CLAUDE_UPDATE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        return -1, f"{CLAUDE_UPDATE_TIMEOUT_SECONDS // 60}분 안에 끝나지 않아 중단"
+    output = stdout.decode("utf-8", errors="replace")
+    return proc.returncode, re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", output).strip()
+
+
+def _claude_update_due(now: datetime) -> bool:
+    start, end = (
+        now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        for hour, minute in map(_parse_hhmm, CLAUDE_UPDATE_WINDOW)
+    )
+    return start <= now < end and claude_update_state.get("last_date") != now.date().isoformat()
+
+
+def _save_claude_update_state():
+    try:
+        with open(CLAUDE_UPDATE_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(claude_update_state, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        logger.warning(f"Claude 업데이트 상태 저장 실패: {e}")
+
+
+async def _claude_login_warning(now: datetime | None = None) -> str | None:
+    """claude.ai 로그인이 곧 끝나거나 읽히지 않으면 알릴 문구를 돌려준다.
+
+    -p의 만료 경고는 text 출력의 stderr에만 나와 stream-json을 쓰는 봇에는 보이지 않는다.
+    """
+    try:
+        status = json.loads(await _maintenance_probe([CLAUDE_PATH, "auth", "status"]))
+    except Exception as e:
+        logger.warning(f"Claude 로그인 상태 확인 실패: {e}")
+        return "⚠️ Claude Code 로그인 상태를 읽지 못했습니다. 로그아웃됐을 수 있으니 `claude auth status`로 확인해 주세요."
+    if not status.get("loggedIn"):
+        return "⚠️ Claude Code가 로그아웃 상태입니다. `claude auth login`으로 다시 로그인해 주세요."
+    raw = status.get("loginExpiresAt")
+    if not raw:
+        return None  # API 키 등 만료일이 없는 로그인
+    try:
+        expires = datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        logger.warning(f"Claude 로그인 만료일 형식 이상: {raw}")
+        return None
+    claude_update_state["login_expires_at"] = raw
+    now = now or datetime.now().astimezone()
+    left = expires - now
+    if left > timedelta(days=CLAUDE_LOGIN_WARN_DAYS):
+        return None
+    when = expires.strftime("%Y-%m-%d %H:%M")
+    if left <= timedelta(0):
+        return f"⚠️ Claude Code claude.ai 로그인이 {when}에 만료됐습니다. `claude auth login`으로 다시 로그인해 주세요."
+    days = left.days
+    remain = f"{days}일" if days else f"{int(left.total_seconds() // 3600)}시간"
+    return (f"⚠️ Claude Code claude.ai 로그인이 {when}에 만료됩니다 ({remain} 남음). "
+            f"만료되면 모든 채널이 멈추니 미리 `claude auth login`으로 다시 로그인해 주세요.")
+
+
+async def _update_claude_cli(bot: commands.Bot):
+    """하루 한 번 CLI를 올리고, 올랐으면 채널들이 새 버전으로 이어지게 한 뒤 변경점 검토를 맡긴다.
+    업데이트 결과와 상관없이 로그인 만료가 가까우면 함께 알린다."""
+    # 실패해도 같은 날 다시 시도하지 않도록 먼저 기록한다
+    claude_update_state.clear()
+    claude_update_state["last_date"] = datetime.now().date().isoformat()
+    _save_claude_update_state()
+    channel = None
+    if CLAUDE_UPDATE_CHANNEL_ID:
+        channel = bot.get_channel(CLAUDE_UPDATE_CHANNEL_ID)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(CLAUDE_UPDATE_CHANNEL_ID)
+            except Exception as e:
+                logger.warning(f"Claude 업데이트 알림 채널 조회 실패 ({CLAUDE_UPDATE_CHANNEL_ID}): {e}")
+
+    async def notify(text: str):
+        if channel:
+            try:
+                await channel.send(text)
+            except Exception as e:
+                logger.warning(f"Claude 업데이트 알림 실패: {e}")
+
+    try:
+        await _run_claude_update_steps(channel, notify)
+    finally:
+        warning = await _claude_login_warning()
+        _save_claude_update_state()
+        if warning:
+            await notify(warning)
+
+
+async def _run_claude_update_steps(channel, notify):
+    global claude_cli_generation
+    try:
+        before = await _installed_claude_version()
+        code, output = await _run_claude_update_command()
+        after = await _installed_claude_version()
+    except Exception as e:
+        claude_update_state["result"] = f"오류: {e}"
+        _save_claude_update_state()
+        logger.warning(f"Claude CLI 업데이트 실패: {e}")
+        await notify(f"⚠️ Claude Code 새벽 업데이트 실패: {e}")
+        return
+    before_s, after_s = (".".join(map(str, v)) for v in (before, after))
+    claude_update_state.update(before=before_s, after=after_s)
+    if after <= before:
+        claude_update_state["result"] = "최신" if code == 0 else f"실패 (exit {code})"
+        _save_claude_update_state()
+        if code == 0:
+            logger.info(f"Claude CLI 최신 상태 ({after_s})")
+        else:
+            logger.warning(f"Claude CLI 업데이트 실패 (exit {code}): {output[-500:]}")
+            await notify(f"⚠️ Claude Code 새벽 업데이트 실패 (현재 `{after_s}`, exit {code})\n```\n{output[-1500:]}\n```")
+        return
+
+    claude_cli_generation += 1
+    claude_update_state["result"] = "업데이트"
+    _save_claude_update_state()
+    logger.info(f"Claude CLI 업데이트: {before_s} → {after_s}")
+    await notify(
+        f"🔄 Claude Code `{before_s}` → `{after_s}` 업데이트 완료. "
+        f"각 채널은 다음 메시지부터 새 버전으로 이어집니다 (대화는 그대로)."
+    )
+    if channel:
+        try:
+            # 예약 작업으로 넣어 채널이 바쁠 때 미루기·대기열 처리를 그대로 쓴다
+            when = (datetime.now() + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
+            _add_schedule_job("once", when, CLAUDE_UPDATE_REVIEW_PROMPT.format(before=before_s, after=after_s),
+                              CLAUDE_UPDATE_CHANNEL_ID)
+        except Exception as e:
+            logger.warning(f"Claude 변경점 검토 예약 실패: {e}")
+
+
 def _update_restart_blockers() -> list[str]:
     current = asyncio.current_task()
     blockers = []
@@ -5011,6 +5203,7 @@ async def _resume_persisted_channel_pending(bot: commands.Bot):
 
 
 async def _scheduler_loop(bot: commands.Bot):
+    global claude_update_task
     await bot.wait_until_ready()
     logger.info("예약 작업 + Codex 자동 재개 스케줄러 시작")
     while not bot.is_closed():
@@ -5046,6 +5239,9 @@ async def _scheduler_loop(bot: commands.Bot):
                 job["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 save_schedules()
                 asyncio.create_task(_run_scheduled_job(bot, job_id, job))
+
+            if (claude_update_task is None or claude_update_task.done()) and _claude_update_due(now):
+                claude_update_task = asyncio.create_task(_update_claude_cli(bot))
 
             for channel_id, job in list(codex_deferred_jobs.items()):
                 if job.get("running"):

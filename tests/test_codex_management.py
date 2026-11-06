@@ -197,6 +197,11 @@ class ClaudeEffortTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("run_in_background", prompt)
         self.assertNotIn("\n", prompt)
 
+    async def test_spawn_connects_chrome(self):
+        call, _ = await self._spawn_args()
+
+        self.assertIn("--chrome", call.args)
+
     async def test_effort_change_respawns_on_next_message(self):
         proc = AsyncMock()
         proc.returncode = None
