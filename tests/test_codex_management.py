@@ -202,6 +202,13 @@ class ClaudeEffortTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("--chrome", call.args)
 
+    async def test_spawn_asks_for_korean_even_after_english_input(self):
+        call, _ = await self._spawn_args()
+
+        prompt = call.args[call.args.index("--append-system-prompt") + 1]
+        self.assertIn("항상 한국어로", prompt)
+        self.assertIn("task-notification", prompt)
+
     async def test_effort_change_respawns_on_next_message(self):
         proc = AsyncMock()
         proc.returncode = None

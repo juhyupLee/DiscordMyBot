@@ -127,7 +127,11 @@ CLAUDE_APPEND_SYSTEM_PROMPT = (
     "구현·수정·빌드·검증처럼 오래 걸릴 작업을 백그라운드 서브에이전트(Agent 도구의 run_in_background)로 "
     "돌리기 전에는, 사용자가 요청한 작업을 나눠 돌리는 경우라도 무엇을 몇 개 띄울지 한두 줄로 알리고 "
     "사용자의 답을 받은 뒤에 시작한다. 사용자가 이 대화에서 백그라운드나 병렬 작업을 직접 요청했으면 묻지 않는다. "
-    "이번 턴 안에 결과를 받아 쓰는 짧은 조사·검색용 서브에이전트는 묻지 않고 써도 된다."
+    "이번 턴 안에 결과를 받아 쓰는 짧은 조사·검색용 서브에이전트는 묻지 않고 써도 된다. "
+    # 설정의 language: ko는 CLI가 이미 넣지만, 영어로 된 작업 완료 알림이나 이미지 안내 바로 뒤에는
+    # 영어로 답하는 일이 있어(11/6~7 응답 438개 중 17개) 그 경우를 짚어 둔다.
+    "사용자에게 하는 답은 항상 한국어로 쓴다. 백그라운드 작업 완료 알림(task-notification), 이미지 첨부 안내, "
+    "도구 결과, 웹 페이지처럼 영어로 된 입력 바로 뒤에 답할 때도 한국어로 쓰고, 코드·명령어·경로·식별자만 원문대로 둔다."
 )
 # 네이티브 설치 CLI는 스스로 업데이트하지 않아, 아무도 쓰지 않는 새벽(최근 기록상 04~06시)에 하루 한 번
 # `claude update`를 돌린다. 봇이 이 시간에 꺼져 있었으면 마감 전까지는 켜지는 대로 돌린다.
@@ -2369,6 +2373,56 @@ def split_message(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
     return chunks
 
 
+def _discord_markdown(text: str) -> str:
+    """디스코드는 Markdown 표를 그리지 않으므로 표 줄을 코드블록으로 감싸 칸이 보이게 한다."""
+    out, table, in_fence = [], [], False
+    for line in text.split("\n"):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+        elif not in_fence and line.lstrip().startswith("|"):
+            table.append(line)
+            continue
+        if table:
+            out += ["```", *table, "```"]
+            table = []
+        out.append(line)
+    if table:
+        out += ["```", *table, "```"]
+    return "\n".join(out)
+
+
+def _close_open_fence(text: str) -> str:
+    """스트리밍 중 아직 닫히지 않은 코드블록을 닫아, 뒤 내용이 깨지지 않게 보여 준다."""
+    fences = sum(1 for line in text.split("\n") if line.lstrip().startswith("```"))
+    return text + "\n```" if fences % 2 else text
+
+
+def _claude_preview(text: str) -> str:
+    return _close_open_fence(_discord_markdown(text))
+
+
+# Claude 답은 코드블록에 넣지 않고 Markdown 그대로 보내 링크를 누를 수 있게 하되,
+# 답 속 문자열로 멘션이 가거나 링크마다 미리보기 카드가 붙어 채널이 길어지지 않게 한다
+CLAUDE_REPLY_SEND_KWARGS = {"allowed_mentions": discord.AllowedMentions.none(), "suppress_embeds": True}
+
+
+def split_markdown_message(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
+    """split_message처럼 줄 단위로 나누되, 코드블록 중간에서 끊기면 닫고 다음 조각에서 다시 연다."""
+    chunks, opener = [], None
+    # 다시 여는 줄(최대 20자)과 닫는 줄이 들어갈 자리를 남긴다
+    for piece in split_message(text, limit - 30):
+        start = opener
+        for line in piece.split("\n"):
+            if line.lstrip().startswith("```"):
+                opener = None if opener else line.strip()[:20]
+        if start:
+            piece = f"{start}\n{piece}"
+        if opener:
+            piece += "\n```"
+        chunks.append(piece)
+    return chunks
+
+
 async def send_codex_result_to_channel(
     channel,
     result_text: str,
@@ -3697,17 +3751,17 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
                     return
 
                 display = stream_buf
-                if len(display) > MAX_MSG_LEN - 10:
-                    cut = stream_buf[:MAX_MSG_LEN - 10]
-                    remainder = stream_buf[MAX_MSG_LEN - 10:]
+                if len(display) > MAX_MSG_LEN - 40:
+                    cut = stream_buf[:MAX_MSG_LEN - 40]
+                    remainder = stream_buf[MAX_MSG_LEN - 40:]
                     try:
                         if stream_msg:
-                            await stream_msg.edit(content=f"```\n{cut}\n```")
+                            await stream_msg.edit(content=_claude_preview(cut))
                         else:
-                            send_kwargs = {}
+                            send_kwargs = dict(CLAUDE_REPLY_SEND_KWARGS)
                             if reply_to:
                                 send_kwargs["reference"] = reply_to
-                            stream_msg = await status_channel.send(f"```\n{cut}\n```", **send_kwargs)
+                            stream_msg = await status_channel.send(_claude_preview(cut), **send_kwargs)
                         stream_msgs.append(stream_msg)
                     except Exception:
                         pass
@@ -3717,12 +3771,12 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
 
                 try:
                     if stream_msg:
-                        await stream_msg.edit(content=f"```\n{display}\n```")
+                        await stream_msg.edit(content=_claude_preview(display))
                     elif display.strip():
-                        send_kwargs = {}
+                        send_kwargs = dict(CLAUDE_REPLY_SEND_KWARGS)
                         if reply_to and not stream_msgs:
                             send_kwargs["reference"] = reply_to
-                        stream_msg = await status_channel.send(f"```\n{display}\n```", **send_kwargs)
+                        stream_msg = await status_channel.send(_claude_preview(display), **send_kwargs)
                 except Exception:
                     pass
                 last_edit_time = now
@@ -3967,12 +4021,11 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
 
             # 스트리밍 메시지를 최종 result로 교체
             if result_text and status_channel:
-                final_chunks = split_message(result_text)
+                final_chunks = split_markdown_message(_discord_markdown(result_text))
                 if stream_msg and stream_msg not in stream_msgs:
                     stream_msgs.append(stream_msg)
 
-                for i, chunk in enumerate(final_chunks):
-                    content = f"```\n{chunk}\n```"
+                for i, content in enumerate(final_chunks):
                     if i < len(stream_msgs):
                         try:
                             await stream_msgs[i].edit(content=content)
@@ -3980,7 +4033,7 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
                             pass
                     else:
                         try:
-                            send_kwargs = {}
+                            send_kwargs = dict(CLAUDE_REPLY_SEND_KWARGS)
                             if reply_to and i == 0 and not stream_msgs:
                                 send_kwargs["reference"] = reply_to
                             await status_channel.send(content, **send_kwargs)

@@ -139,6 +139,37 @@ class ClaudeAutoTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "사용자 질문에 대한 답")
         self.assertTrue(watcher.cancelled())
 
+    async def test_reply_is_sent_as_markdown_with_clickable_links(self):
+        sent = []
+
+        def record(*args, **kwargs):
+            msg = _message()
+            sent.append((args[0] if args else "", kwargs, msg))
+            return msg
+
+        channel = MagicMock()
+        channel.send = AsyncMock(side_effect=record)
+        session = _session(channel)
+        bot.channel_claude_procs[CHANNEL] = session
+        answer = "문서는 https://code.claude.com/docs 에 있습니다.\n\n| 항목 | 값 |\n|---|---|\n| 버전 | 2.1.319 |"
+
+        async def send(sess, content):
+            for event in _turn_events(answer):
+                sess["event_queue"].put_nowait(event)
+
+        with patch.object(bot, "get_or_spawn_proc", new=AsyncMock(return_value=session)), \
+                patch.object(bot, "send_user_message", new=AsyncMock(side_effect=send)):
+            await bot._run_claude_once("질문", "C:/repo", CHANNEL, status_channel=channel)
+
+        text, kwargs, msg = next(item for item in sent if "https://" in item[0])
+        edits = [c.kwargs["content"] for c in msg.edit.await_args_list if "content" in c.kwargs]
+        final = edits[-1] if edits else text
+        # 코드블록에 넣지 않아야 디스코드가 링크를 누를 수 있게 만든다
+        self.assertTrue(final.startswith("문서는 https://code.claude.com/docs"))
+        self.assertIn("```\n| 항목 | 값 |", final)
+        self.assertTrue(kwargs["suppress_embeds"])
+        self.assertFalse(kwargs["allowed_mentions"].everyone)
+
     async def test_failed_resume_does_not_save_stale_session(self):
         channel = _channel()
         session = _session(channel)
