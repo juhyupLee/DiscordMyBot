@@ -983,6 +983,7 @@ async def _run_codex_management_command(
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     proc = await asyncio.create_subprocess_exec(*_codex_command(args), **kwargs)
+    _attach_to_kill_on_close_job(proc)
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -2567,6 +2568,7 @@ async def spawn_persistent_proc(channel_id: int, work_dir: str) -> dict:
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
     proc = await asyncio.create_subprocess_exec(*cmd, limit=1024*1024, **kwargs)
+    _attach_to_kill_on_close_job(proc)
     event_queue: asyncio.Queue = asyncio.Queue()
     reader_task = asyncio.create_task(_stdout_reader(channel_id, proc, event_queue))
     stderr_buffer: list[str] = []
@@ -2671,6 +2673,132 @@ async def _terminate_process_tree(proc, *, timeout: float = 8.0):
         await asyncio.wait_for(proc.wait(), timeout=2)
     except (asyncio.TimeoutError, ProcessLookupError, OSError):
         pass
+
+
+# 봇이 어떤 이유로 죽어도(재시작·강제 종료·충돌) 봇이 띄운 Claude/Codex 프로세스가 고아로 남지 않게 한다.
+# 2026-11-07 15:41 봇 재시작 뒤 이전 Claude 프로세스가 남아 같은 세션 작업을 이어 갔고, 그 메시지는
+# 새 봇에 닿지 않아 사용자에게는 멈춘 것처럼 보였다. 다음 메시지에 새 프로세스가 같은 세션을 --resume해
+# 두 프로세스가 같은 파일을 동시에 다뤘다.
+_child_job_handle = None
+
+
+def _attach_to_kill_on_close_job(proc) -> bool:
+    """Windows Job Object(KILL_ON_JOB_CLOSE)에 자식을 넣는다. 봇 프로세스가 끝나면 OS가 그 트리를 함께 끝낸다."""
+    global _child_job_handle
+    if os.name != "nt" or proc is None or getattr(proc, "pid", None) is None:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        if _child_job_handle is None:
+            class _IoCounters(ctypes.Structure):
+                _fields_ = [(name, ctypes.c_ulonglong) for name in (
+                    "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                    "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+            class _BasicLimit(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                    ("PerJobUserTimeLimit", ctypes.c_longlong),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD),
+                ]
+
+            class _ExtendedLimit(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", _BasicLimit),
+                    ("IoInfo", _IoCounters),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            job = kernel32.CreateJobObjectW(None, None)
+            if not job:
+                return False
+            info = _ExtendedLimit()
+            info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+                kernel32.CloseHandle(job)
+                return False
+            _child_job_handle = job
+
+        handle = kernel32.OpenProcess(0x0100 | 0x0001, False, proc.pid)  # PROCESS_SET_QUOTA | PROCESS_TERMINATE
+        if not handle:
+            return False
+        try:
+            return bool(kernel32.AssignProcessToJobObject(_child_job_handle, handle))
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception as e:
+        logger.warning(f"자식 프로세스 종료 연동(Job Object) 실패: pid={getattr(proc, 'pid', None)} {e}")
+        return False
+
+
+def _is_orphaned_bot_claude(info: dict, parent: dict | None, claude_exe: str) -> bool:
+    """봇이 띄운 persistent Claude(-p, stream-json)인데 부모 봇(python)이 이미 없으면 고아다."""
+    if (info.get("name") or "").lower() != "claude.exe":
+        return False
+    if os.path.normcase(os.path.abspath(info.get("exe") or "")) != os.path.normcase(os.path.abspath(claude_exe)):
+        return False
+    cmdline = info.get("cmdline") or []
+    if "-p" not in cmdline or "--input-format" not in cmdline or "stream-json" not in cmdline:
+        return False
+    if parent is None:
+        return True
+    # PID 재사용 대비: 자식보다 늦게 생긴 부모나 python이 아닌 부모는 원래 봇이 아니다.
+    if (parent.get("create_time") or 0) > (info.get("create_time") or 0):
+        return True
+    return not (parent.get("name") or "").lower().startswith("python")
+
+
+def _kill_orphaned_bot_claude_processes() -> int:
+    """시작할 때 이전 봇 인스턴스가 남긴 고아 Claude 프로세스 트리를 끝낸다(단일 인스턴스 락을 잡은 뒤 호출)."""
+    try:
+        import psutil
+    except ImportError:
+        return 0
+    killed = 0
+    for candidate in psutil.process_iter(["pid", "name", "exe", "cmdline", "ppid", "create_time"]):
+        try:
+            info = candidate.info
+            parent = None
+            try:
+                parent_proc = psutil.Process(info.get("ppid") or 0)
+                parent = {"name": parent_proc.name(), "create_time": parent_proc.create_time()}
+            except (psutil.Error, ValueError):
+                parent = None
+            if not _is_orphaned_bot_claude(info, parent, CLAUDE_PATH):
+                continue
+            tree = candidate.children(recursive=True) + [candidate]
+            for member in tree:
+                try:
+                    member.kill()
+                except psutil.Error:
+                    pass
+            killed += 1
+            logger.warning(f"이전 봇이 남긴 고아 Claude 프로세스 정리: pid={info.get('pid')} 자식 {len(tree) - 1}개")
+        except psutil.Error:
+            continue
+    return killed
 
 
 async def _stop_channel_codex_run(channel_id: int) -> bool:
@@ -3187,6 +3315,7 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
 
     try:
         proc = await asyncio.create_subprocess_exec(*cmd, limit=1024*1024, **kwargs)
+        _attach_to_kill_on_close_job(proc)
     except FileNotFoundError:
         if status_msg:
             try:
@@ -6351,6 +6480,13 @@ if __name__ == "__main__":
     if ALLOWED_USER_ID == 0:
         print("ALLOWED_USER_ID가 설정되지 않았습니다. .env 파일을 확인하세요.")
         exit(1)
+
+    try:
+        orphan_count = _kill_orphaned_bot_claude_processes()
+        if orphan_count:
+            logger.warning(f"시작 전 고아 Claude 프로세스 {orphan_count}개를 정리했다")
+    except Exception as e:
+        logger.warning(f"고아 Claude 프로세스 정리 실패: {e}")
 
     try:
         bot = create_bot()

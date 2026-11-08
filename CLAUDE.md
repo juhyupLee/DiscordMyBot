@@ -35,6 +35,7 @@ Discord 메시지로 Claude Code CLI를 원격 실행하는 봇. 채널별 독�
 - 서브에이전트 확인 규칙: 데스크톱 앱은 별도 작업을 하위 세션 카드로 먼저 묻지만 -p 모드에는 그 도구가 없으므로, 오래 걸릴 백그라운드 서브에이전트를 띄우기 전에 사용자에게 묻도록 `CLAUDE_APPEND_SYSTEM_PROMPT`를 덧붙임 (짧은 조사용 서브에이전트와 사용자가 병렬을 직접 요청한 경우는 제외)
 - 한국어 고정: 설정의 `language: ko`는 CLI가 넣지만 영어 작업 완료 알림·이미지 안내 직후엔 영어로 답하는 일이 있어(11/6~7 438개 중 17개), 그때도 한국어로 답하라고 같은 프롬프트에 덧붙임
 - **채널당 장기 실행 프로세스 1개** 유지 (매 메시지마다 spawn 안 함)
+- 고아 프로세스 방지: 봇이 띄운 Claude/Codex는 Windows Job Object(KILL_ON_JOB_CLOSE)에 넣어 봇이 어떤 이유로 끝나도 함께 끝남. 시작할 때는 이전 봇이 남긴 고아(부모 python이 없는 `-p --input-format stream-json` Claude) 트리를 정리 (2026-11-07 봇 재시작 뒤 이전 프로세스가 남아 같은 세션을 이어 작업하고 메시지가 사라진 문제)
 - user 메시지는 stdin에 JSON 라인으로 전송: `{"type":"user","message":{"role":"user","content":"..."}}`
 - stdout은 백그라운드 `_stdout_reader` 태스크가 계속 읽어 `asyncio.Queue`로 전달
 - 턴 완료는 `result` 이벤트 수신으로 판정 (프로세스는 유지)
