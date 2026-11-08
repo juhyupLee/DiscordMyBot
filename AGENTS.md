@@ -25,7 +25,7 @@ Discord 메시지로 Claude Code CLI 또는 Codex CLI를 원격 실행하는 봇
 1. `CLAUDE_CATEGORY_ID` 카테고리 채널에서 `ALLOWED_USER_ID` 사용자 메시지만 처리한다
 2. `!`로 시작하지 않는 메시지는 채널 백엔드(`channel_backends`, 없으면 `DEFAULT_BACKEND`)로 보낸다. 작업 폴더는 `channel_workdirs`, 없으면 `WORKING_DIR`
 3. 작업 중 새 메시지:
-   - Claude: 대기열(`channel_pending_jobs.json`, 재시작 후에도 유지)에 넣고, 턴이 끝나면 쌓인 요청을 합쳐 한 번에 보낸다
+   - Claude: 진행 중인 턴에 stdin으로 바로 넣는다(`steer_claude_turn`). CLI는 지금 실행 중인 도구가 끝난 뒤 같은 턴에 넣고, 마지막 답을 쓰던 중이면 그 턴 뒤에 새 턴을 연다. 어느 쪽인지는 CLI가 받아들일 때 다시 출력하는 메시지(`--replay-user-messages`)로 알고, 새 턴이면 같은 작업으로 받아 그 메시지에 답한다 (2026-11-08 `-p` stream-json 시험). 넣을 턴이 없을 때(프로세스 시작·유휴 압축 중), `대기:`로 시작하거나 `/` 명령이면 대기열(`channel_pending_jobs.json`, 재시작 후에도 유지)에 넣고 턴이 끝나면 합쳐서 보낸다
    - Codex: 진행 중 작업에 후속 지시로 전달(steer)한다. `대기:`로 시작하면 다음 작업으로 대기열에 넣는다. 한도로 자동 재개를 기다리는 중이면 그 대기열에 보관한다
 4. 답은 1900자 단위로 나눠 Markdown 그대로 보낸다 (링크를 누를 수 있게 코드블록에 넣지 않음). 디스코드가 그리지 않는 표는 코드블록으로 감싸고, 나뉜 조각에서 끊긴 코드블록은 닫았다 다시 연다. 멘션은 막고 링크 미리보기 카드는 끈다
 5. 알림은 턴마다 한 번: 진행 중 메시지(처리 중·도구 상태·쓰는 중인 글·통계·대기 요청 재개 안내, Codex 진행 표시)는 `silent=True`(`QUIET`)로 보낸다. 디스코드는 수정에는 알림을 보내지 않으므로, 턴이 끝나면 최종 답을 새 메시지로 보내고(다 보내면 쓰는 중이던 글은 삭제) 그 답만 알림이 간다 (2026-11-08, 긴 턴은 진행 표시만으로 알림이 평균 15개 왔음)
@@ -33,7 +33,7 @@ Discord 메시지로 Claude Code CLI 또는 Codex CLI를 원격 실행하는 봇
 ## Claude 백엔드 (persistent)
 
 - 경로: `~/.local/bin/claude.exe` (`CLAUDE_PATH`로 변경)
-- 플래그: `--dangerously-skip-permissions -p --input-format stream-json --output-format stream-json --include-partial-messages --verbose --chrome --add-dir <attachments> --add-dir ~/.claude --append-system-prompt <CLAUDE_APPEND_SYSTEM_PROMPT>`, 채널 설정에 따라 `--resume`·`--model`·`--effort`
+- 플래그: `--dangerously-skip-permissions -p --input-format stream-json --output-format stream-json --include-partial-messages --verbose --replay-user-messages --chrome --add-dir <attachments> --add-dir ~/.claude --append-system-prompt <CLAUDE_APPEND_SYSTEM_PROMPT>`, 채널 설정에 따라 `--resume`·`--model`·`--effort`
 - 채널당 장기 실행 프로세스 1개를 봇이 끝날 때까지 유지한다. 작업 폴더가 바뀌면 다시 띄운다 (cwd는 시작 때 고정)
 - user 메시지는 stdin에 JSON 한 줄(`{"type":"user","message":{"role":"user","content":"..."}}`)로 보내고, `_stdout_reader`가 stdout을 `asyncio.Queue`로 넘긴다. 턴 완료는 `result` 이벤트로 판정한다. 턴 타임아웃은 없고 사용자가 `중지`로 끊는다
 - 자동 턴: 턴 사이에도 출력을 지켜보다가 Claude가 스스로 시작한 턴(백그라운드 작업 완료 알림 등)을 디스코드로 전달한다

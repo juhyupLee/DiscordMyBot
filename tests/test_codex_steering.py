@@ -348,7 +348,8 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
             bot.channel_codex_runs[self.ch] = {"client": self.client, "followups": []}
             await bot._route_channel_prompt(self.ch, "대기: 원문", self.message, [])
         self.client.steer.assert_not_awaited()
-        self.assertEqual(bot.channel_pending[self.ch][-1]["prompt"], "대기: 원문")
+        # Claude 채널도 `대기:`를 진행 중인 턴에 넣지 말고 다음 작업으로 미루라는 뜻으로 읽는다
+        self.assertEqual(bot.channel_pending[self.ch][-1]["prompt"], "원문")
 
     async def test_cleanup_barrier_waits_for_rejected_steer_to_queue(self):
         entered, finish = asyncio.Event(), asyncio.Event()

@@ -2527,6 +2527,8 @@ async def spawn_persistent_proc(channel_id: int, work_dir: str) -> dict:
         "--output-format", "stream-json",
         "--include-partial-messages",
         "--verbose",
+        # CLI가 사용자 메시지를 받아들일 때 다시 출력해, 턴 중에 넣은 추가 지시가 그 턴에 들어갔는지 안다
+        "--replay-user-messages",
         # -p 모드는 /chrome의 '기본 켜기' 설정을 따르지 않아 데스크톱처럼 크롬을 쓰려면 직접 켜야 한다
         "--chrome",
         "--add-dir", ATTACH_DIR,
@@ -2591,6 +2593,8 @@ async def spawn_persistent_proc(channel_id: int, work_dir: str) -> dict:
         "idle_task": None,          # 턴 사이 출력 감시 태스크
         "notify_channel": None,     # 자동 턴 결과를 보낼 채널
         "context_tokens": 0,        # 마지막 요청의 컨텍스트 크기 (유휴 압축 판단용)
+        "turn_open": False,         # 턴이 result 전이라 추가 지시를 넣을 수 있음
+        "steers": [],               # 턴 중에 넣었지만 CLI가 아직 받아들이지 않은 추가 지시
     }
     channel_claude_procs[channel_id] = session
     return session
@@ -2877,11 +2881,53 @@ async def send_user_message(session: dict, content: str):
     if drained:
         logger.warning(f"send_user_message: 이전 턴 잔여 이벤트 {drained}개 드레인")
 
-    proc = session["proc"]
+    await _write_claude_user_message(session["proc"], content)
+
+
+async def _write_claude_user_message(proc, content: str):
     msg = {"type": "user", "message": {"role": "user", "content": content}}
     line = json.dumps(msg, ensure_ascii=False) + "\n"
     proc.stdin.write(line.encode("utf-8"))
     await proc.stdin.drain()
+
+
+# 끝나 가던 턴에 넣은 추가 지시로 CLI가 이 시간 안에 새 턴을 열지 않으면 더 기다리지 않는다
+CLAUDE_STEER_FOLLOWUP_WAIT = 60.0
+
+
+async def steer_claude_turn(channel_id: int, content: str, message) -> bool:
+    """진행 중인 Claude 턴에 추가 지시를 바로 넣는다. 넣었으면 True.
+
+    CLI는 다음 도구 결과 뒤에 같은 턴으로 넣고, 그 턴이 이미 끝나 가면 끝난 뒤 새 턴으로 처리한다
+    (2026-11-08 -p stream-json 시험). 어느 쪽인지는 CLI가 받아들일 때 다시 출력하는 메시지로 안다.
+    """
+    session = channel_claude_procs.get(channel_id)
+    if not session or not session.get("turn_open") or session["proc"].returncode is not None:
+        return False
+    try:
+        await _write_claude_user_message(session["proc"], content)
+    except (BrokenPipeError, ConnectionError, OSError) as e:
+        logger.warning(f"채널 {channel_id}: 추가 지시 전달 실패, 대기열로 보관 ({e})")
+        return False
+    session.setdefault("steers", []).append({"content": content, "message": message})
+    logger.info(f"채널 {channel_id}: 진행 중인 Claude 턴에 추가 지시 전달")
+    return True
+
+
+def _note_claude_replay(session: dict, data: dict):
+    """CLI가 받아들이며 다시 출력한 사용자 메시지를 아직 안 들어간 추가 지시 목록에서 지운다."""
+    if not data.get("isReplay"):
+        return
+    content = (data.get("message") or {}).get("content")
+    if isinstance(content, list):
+        content = "".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
+    if not isinstance(content, str):
+        return
+    steers = session.get("steers") or []
+    for i, steer in enumerate(steers):
+        if steer["content"].strip() == content.strip():
+            del steers[i]
+            return
 
 
 # 턴이 끝난 뒤 이 이벤트가 오면 Claude가 스스로 새 턴을 시작한 것(백그라운드 작업 완료 알림 등)
@@ -3801,16 +3847,19 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
                            image_paths: list[str] | None = None,
                            status_channel: discord.TextChannel | None = None,
                            reply_to: discord.Message | None = None,
-                           auto_turn: bool = False) -> str:
+                           auto_turn: bool = False,
+                           followup_of: str | None = None) -> str:
     """run_claude의 단일 실행. persistent 프로세스에서 턴 단위로 실행.
 
     auto_turn이면 메시지를 보내지 않고, Claude가 스스로 시작한 턴의 출력만 받아 전달한다.
+    followup_of는 끝나 가던 턴에 넣은 추가 지시로 CLI가 연 새 턴을 받을 때 앞 턴의 답이다.
+    새 턴이 열리지 않으면 그 답을 그대로 돌려준다.
     """
 
     import time as _time
 
-    # 이번 턴에서 Claude가 작업한 파일 추적 시작 (이전 턴 결과는 폐기)
-    if channel_id:
+    # 이번 턴에서 Claude가 작업한 파일 추적 시작 (이전 턴 결과는 폐기, 추가 지시로 이어진 턴은 같은 작업)
+    if channel_id and followup_of is None:
         channel_recent_files[channel_id] = []
 
     pre_spawn_msg = None
@@ -3892,10 +3941,12 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
             turn_stats = ""            # 답 뒤에 붙일 통계 한 줄
 
             if status_channel:
-                processing_text = (
-                    "🔔 백그라운드 작업 알림으로 Claude가 이어서 응답 중..."
-                    if auto_turn else "⏳ Claude 처리 중..."
-                )
+                if followup_of is not None:
+                    processing_text = "↪️ 추가 지시를 이어서 처리 중..."
+                elif auto_turn:
+                    processing_text = "🔔 백그라운드 작업 알림으로 Claude가 이어서 응답 중..."
+                else:
+                    processing_text = "⏳ Claude 처리 중..."
                 if pre_spawn_msg:
                     try:
                         await pre_spawn_msg.edit(content=processing_text)
@@ -3952,12 +4003,34 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
                     pass
                 last_edit_time = now
 
+            session["turn_open"] = True
+            waiting_followup = followup_of is not None
             while True:
                 # 장시간 도구 실행도 끝까지 기다린다. 사용자는 `중지` 명령으로 직접 취소할 수 있다.
-                data = carry.pop(0) if carry else await event_queue.get()
+                if carry:
+                    data = carry.pop(0)
+                elif waiting_followup:
+                    try:
+                        data = await asyncio.wait_for(event_queue.get(), CLAUDE_STEER_FOLLOWUP_WAIT)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"채널 {channel_id}: 추가 지시로 이어질 턴이 열리지 않음, 앞 턴 답으로 마침")
+                        session["turn_open"] = False
+                        session["steers"] = []
+                        channel_status.pop(channel_id, None)
+                        if status_msg:
+                            try:
+                                await status_msg.delete()
+                            except Exception:
+                                pass
+                        _start_claude_idle_watch(channel_id, session)
+                        return followup_of
+                else:
+                    data = await event_queue.get()
+                waiting_followup = False
 
                 # 프로세스 EOF (예기치 않은 종료)
                 if data.get("__eof__"):
+                    session["turn_open"] = False
                     err = data.get("__error__", "프로세스 종료")
                     logger.warning(f"채널 {channel_id}: {err}")
                     await kill_channel_proc(channel_id)
@@ -3974,6 +4047,10 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
                 if msg_type == "system":
                     if data.get("subtype") == "init" and data.get("model") and channel_id:
                         _note_claude_active_model(channel_id, data["model"])
+                    continue
+
+                if msg_type == "user":
+                    _note_claude_replay(session, data)
                     continue
 
                 # stream_event: 토큰 단위 스트리밍 (--include-partial-messages)
@@ -4130,6 +4207,7 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
 
                 # 턴 완료
                 if msg_type == "result":
+                    session["turn_open"] = False
                     result_text = data.get("result", "")
                     new_session_id = data.get("session_id")
                     # --resume할 대화가 없으면 한 턴도 돌지 않은 오류 result가 그 ID를 그대로 싣고 온다.
@@ -4199,13 +4277,22 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
             # 턴이 끝난 뒤 Claude가 스스로 이어서 응답하면(백그라운드 작업 완료 등) 이 채널로 전달
             if status_channel:
                 session["notify_channel"] = status_channel
-            _start_claude_idle_watch(channel_id, session)
-            return result_text or "(빈 응답)"
+            followup = (session.get("steers") or [None])[-1]
+            if followup is None:
+                _start_claude_idle_watch(channel_id, session)
+                return result_text or "(빈 응답)"
+
+        # 끝나 가던 턴에 넣은 추가 지시는 CLI가 그 턴 뒤에 새 턴으로 처리한다. 같은 작업으로 받아 그 메시지에 답한다
+        logger.info(f"채널 {channel_id}: 추가 지시 {len(session['steers'])}개가 새 턴으로 이어짐")
+        return await _run_claude_once(None, work_dir, channel_id, status_channel=status_channel,
+                                      reply_to=followup.get("message") or reply_to, auto_turn=True,
+                                      followup_of=result_text or "(빈 응답)")
 
     except asyncio.CancelledError:
         raise
     except Exception as e:
         logger.error(f"Claude 실행 오류: {e}", exc_info=True)
+        session["turn_open"] = False
         channel_status.pop(channel_id, None)
         return f"오류 발생: {e}"
 
@@ -5528,7 +5615,7 @@ async def _handle_message(message: discord.Message, bot: commands.Bot):
 async def _route_channel_prompt(ch_id: int, prompt: str, message, image_paths: list[str]):
     """Single admission path for ordinary, prefix and slash Codex messages."""
     backend = channel_backends.get(ch_id, DEFAULT_BACKEND)
-    force_queue = backend == "codex" and prompt.startswith("대기:")
+    force_queue = prompt.startswith("대기:")
     if force_queue:
         prompt = prompt[len("대기:"):].strip()
         if not prompt:
@@ -5558,13 +5645,19 @@ async def _route_channel_prompt(ch_id: int, prompt: str, message, image_paths: l
                     run["followups"].append({"prompt": prompt, "image_paths": list(image_paths)})
                     await message.reply("↪️ 현재 작업에 후속 지시를 전달했습니다.")
                     return
+        # Claude도 진행 중인 턴에 바로 넣는다. 턴 중 동작을 확인하지 않은 슬래시 명령은 기존처럼 대기열로 보낸다
+        if backend != "codex" and channel_busy.get(ch_id) and not force_queue and not prompt.startswith("/"):
+            work_dir = channel_workdirs.get(ch_id, WORKING_DIR)
+            if await steer_claude_turn(ch_id, add_screenshot_output_instruction(prompt, work_dir), message):
+                await message.reply("↪️ 진행 중인 작업에 전달했습니다. 지금 하던 단계가 끝나면 반영됩니다.", **QUIET)
+                return
         if backend == "codex" and ch_id in codex_deferred_jobs:
             job = _append_deferred_request(ch_id, prompt, image_paths)
             await message.reply(f"📥 Codex 자동 재개 대기열에 보관했습니다. (재개 예정 `{job.get('retry_at') if job else '확인 중'}`)")
             return
         if channel_busy.get(ch_id):
             _queue_channel_pending(ch_id, prompt, message, image_paths)
-            if backend == "codex":
+            if backend == "codex" or force_queue:
                 await message.reply("📥 다음 작업으로 대기열에 보관했습니다.")
             return
         channel_busy[ch_id] = True

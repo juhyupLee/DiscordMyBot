@@ -264,30 +264,37 @@ class ClaudeAutoTurnTests(unittest.IsolatedAsyncioTestCase):
         auto_index = next(i for i, t in enumerate(texts) if "자동 턴 결과" in t)
         self.assertNotIn("사용자 답", "".join(texts[:auto_index]))
 
-    async def test_messages_queued_during_auto_turn_run_afterwards(self):
+    async def test_message_during_auto_turn_goes_into_that_turn(self):
         channel = _channel()
         session = _session(channel)
+        session["proc"].stdin.drain = AsyncMock()
         bot.channel_claude_procs[CHANNEL] = session
         bot._start_claude_idle_watch(CHANNEL, session)
         auto_task = session["idle_task"]
 
         for event in _turn_events("자동 턴 결과")[:-1]:
             session["event_queue"].put_nowait(event)
-        await self._wait_for(lambda: bot.channel_busy.get(CHANNEL))
+        await self._wait_for(lambda: session.get("turn_open"))
 
-        # 자동 턴 중 들어온 사용자 메시지는 기존 경로대로 대기열로 간다
+        # 자동 턴 중 들어온 사용자 메시지도 진행 중인 턴에 바로 넣는다
         user_message = MagicMock()
+        user_message.reply = AsyncMock()
         with patch.object(bot, "_process_channel", new=AsyncMock()) as process:
             await bot._route_channel_prompt(CHANNEL, "됏나?", user_message, [])
-            process.assert_not_called()
+            written = session["proc"].stdin.write.call_args.args[0].decode("utf-8")
+            self.assertIn("됏나?", written)
+            self.assertIn("↪️", user_message.reply.await_args.args[0])
 
+            session["event_queue"].put_nowait(
+                {"type": "user", "isReplay": True, "message": {"role": "user", "content": "됏나?"}})
             session["event_queue"].put_nowait({"type": "result", "result": "자동 턴 결과"})
             await asyncio.wait_for(auto_task, 2)
             await asyncio.sleep(0)
 
-            process.assert_called_once_with(CHANNEL, "됏나?", user_message, [])
-        self.assertTrue(bot.channel_busy.get(CHANNEL))
+            process.assert_not_called()
+        self.assertFalse(bot.channel_busy.get(CHANNEL))
         self.assertNotIn(CHANNEL, bot.channel_pending)
+        self.assertEqual(session["steers"], [])
 
     async def test_process_exit_while_idle_stops_quietly(self):
         channel = _channel()
