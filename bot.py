@@ -2819,6 +2819,42 @@ def _claude_model_usage_totals(model_usage: dict | None) -> tuple[float, float]:
     return weighted, cost
 
 
+def _usd(value: float) -> str:
+    return f"${value:,.2f}" if value >= 1 else f"${value:.3f}"
+
+
+def _claude_turn_stats(data: dict, session: dict, prev_model_usage: dict | None) -> str:
+    """턴 결과 한 줄. 입력은 캐시 읽기·쓰기까지 더한 실제 처리량으로 보인다.
+    usage.input_tokens는 캐시에 없던 몇십 토큰뿐이라 그것만 보면 실제보다 훨씬 작아 보인다."""
+    parts = []
+    if data.get("modelUsage"):
+        # total_cost_usd는 프로세스 누적이라 이번 턴 몫은 직전 누적과의 차이로 구한다
+        turn_cost = (_claude_model_usage_totals(data["modelUsage"])[1]
+                     - _claude_model_usage_totals(prev_model_usage)[1])
+        parts.append(f"💰 {_usd(max(0.0, turn_cost))}")
+    total_cost = data.get("total_cost_usd")
+    if total_cost is not None:
+        parts.append(f"(세션 {_usd(total_cost)})")
+    duration_ms = data.get("duration_ms")
+    if duration_ms is not None:
+        parts.append(f"⏱️ {duration_ms / 1000:.1f}s")
+    num_turns = data.get("num_turns")
+    if num_turns is not None:
+        parts.append(f"🔄 {num_turns}턴")
+    counts = _claude_token_counts(data.get("usage") or {})
+    cache_read = counts["cache_read"]
+    total_input = counts["input"] + counts["cache_write_5m"] + counts["cache_write_1h"] + cache_read
+    if total_input or counts["output"]:
+        tokens = f"📊 입력 {_compact_token_count(total_input)}"
+        if total_input:
+            tokens += f" (캐시 읽기 {cache_read * 100 // total_input}%)"
+        tokens += f" → 출력 {_compact_token_count(counts['output'])}"
+        if session.get("context_tokens"):
+            tokens += f" · 지금 대화 {_compact_token_count(session['context_tokens'])}"
+        parts.append(tokens)
+    return " ".join(parts)
+
+
 def _save_claude_idle_compact_stats():
     try:
         with open(CLAUDE_IDLE_COMPACT_STATS_FILE, "w", encoding="utf-8") as f:
@@ -3968,31 +4004,15 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
                         if not result_text:
                             result_text = f"오류 발생: Claude 실행 실패 ({data.get('subtype') or 'result 오류'})"
 
+                    prev_model_usage = session.get("model_usage")
                     if data.get("modelUsage"):
                         session["model_usage"] = data["modelUsage"]
 
                     if status_channel:
-                        stats_parts = []
-                        cost = data.get("cost_usd")
-                        if cost is not None:
-                            stats_parts.append(f"💰 ${cost:.4f}")
-                        total_cost = data.get("total_cost_usd")
-                        if total_cost is not None:
-                            stats_parts.append(f"(세션 ${total_cost:.4f})")
-                        duration_ms = data.get("duration_ms")
-                        if duration_ms is not None:
-                            stats_parts.append(f"⏱️ {duration_ms / 1000:.1f}s")
-                        num_turns = data.get("num_turns")
-                        if num_turns is not None:
-                            stats_parts.append(f"🔄 {num_turns}턴")
-                        usage = data.get("usage", {})
-                        input_tokens = usage.get("input_tokens", 0)
-                        output_tokens = usage.get("output_tokens", 0)
-                        if input_tokens or output_tokens:
-                            stats_parts.append(f"📊 {input_tokens:,}→{output_tokens:,} tok")
-                        if stats_parts:
+                        stats = _claude_turn_stats(data, session, prev_model_usage)
+                        if stats:
                             try:
-                                await status_channel.send(" ".join(stats_parts))
+                                await status_channel.send(stats)
                             except Exception:
                                 pass
 
