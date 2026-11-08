@@ -161,14 +161,56 @@ class ClaudeAutoTurnTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(bot, "send_user_message", new=AsyncMock(side_effect=send)):
             await bot._run_claude_once("질문", "C:/repo", CHANNEL, status_channel=channel)
 
-        text, kwargs, msg = next(item for item in sent if "https://" in item[0])
-        edits = [c.kwargs["content"] for c in msg.edit.await_args_list if "content" in c.kwargs]
-        final = edits[-1] if edits else text
+        final, kwargs, _ = [item for item in sent if "https://" in item[0]][-1]
         # 코드블록에 넣지 않아야 디스코드가 링크를 누를 수 있게 만든다
         self.assertTrue(final.startswith("문서는 https://code.claude.com/docs"))
         self.assertIn("```\n| 항목 | 값 |", final)
         self.assertTrue(kwargs["suppress_embeds"])
         self.assertFalse(kwargs["allowed_mentions"].everyone)
+
+    async def test_only_final_answer_notifies(self):
+        sent = []
+
+        def record(*args, **kwargs):
+            msg = _message()
+            sent.append((args[0] if args else "", kwargs, msg))
+            return msg
+
+        channel = MagicMock()
+        channel.send = AsyncMock(side_effect=record)
+        session = _session(channel)
+        bot.channel_claude_procs[CHANNEL] = session
+        reply_to = MagicMock()
+
+        def text(t):
+            return {"type": "stream_event", "event": {
+                "type": "content_block_delta", "delta": {"type": "text_delta", "text": t}}}
+
+        def tool(name):
+            return {"type": "stream_event", "event": {
+                "type": "content_block_start", "content_block": {"type": "tool_use", "name": name}}}
+
+        async def send(sess, content):
+            # 글 → 도구 → 글 → 도구 → 답: 도구마다 상태 메시지를 새로 보낸다
+            for event in [text("먼저 로그를 봅니다. "), tool("Read"), text("이어서 검색합니다. "),
+                          tool("Grep"), text("원인은 X입니다."),
+                          {"type": "result", "result": "원인은 X입니다.", "session_id": "s",
+                           "duration_ms": 1000, "usage": {"input_tokens": 10, "output_tokens": 5}}]:
+                sess["event_queue"].put_nowait(event)
+
+        with patch.object(bot, "get_or_spawn_proc", new=AsyncMock(return_value=session)), \
+                patch.object(bot, "send_user_message", new=AsyncMock(side_effect=send)):
+            await bot._run_claude_once("질문", "C:/repo", CHANNEL, status_channel=channel, reply_to=reply_to)
+
+        loud = [item for item in sent if not item[1].get("silent")]
+        self.assertEqual([item[0] for item in loud], ["원인은 X입니다."])
+        self.assertIs(loud[0][1]["reference"], reply_to)
+        self.assertGreaterEqual(len(sent) - len(loud), 4)  # 처리 중·글·도구 상태 2번·통계
+        # 쓰는 중이던 글은 답을 보낸 뒤 지우고, 통계 줄은 답 아래에 온다
+        stream = next(item for item in sent if item[0].startswith("먼저 로그를 봅니다"))
+        stream[2].delete.assert_awaited()
+        self.assertTrue(sent[-1][0].startswith("⏱️"))
+        self.assertTrue(sent[-1][1]["silent"])
 
     async def test_failed_resume_does_not_save_stale_session(self):
         channel = _channel()

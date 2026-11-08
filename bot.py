@@ -2404,6 +2404,9 @@ def _claude_preview(text: str) -> str:
 # Claude 답은 코드블록에 넣지 않고 Markdown 그대로 보내 링크를 누를 수 있게 하되,
 # 답 속 문자열로 멘션이 가거나 링크마다 미리보기 카드가 붙어 채널이 길어지지 않게 한다
 CLAUDE_REPLY_SEND_KWARGS = {"allowed_mentions": discord.AllowedMentions.none(), "suppress_embeds": True}
+# 새 메시지마다 휴대폰 알림이 가서, 진행 중 메시지(상태 표시·쓰는 중인 글·통계)는 무음으로 보내고
+# 알림은 턴이 끝난 답 하나에만 가게 한다 (긴 턴은 진행 표시만으로 알림이 15개 넘게 왔다)
+QUIET = {"silent": True}
 
 
 def split_markdown_message(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
@@ -2827,7 +2830,9 @@ def _claude_turn_stats(data: dict, session: dict, prev_model_usage: dict | None)
     """턴 결과 한 줄. 입력은 캐시 읽기·쓰기까지 더한 실제 처리량으로 보인다.
     usage.input_tokens는 캐시에 없던 몇십 토큰뿐이라 그것만 보면 실제보다 훨씬 작아 보인다."""
     parts = []
-    if data.get("modelUsage"):
+    # --resume으로 뜬 프로세스는 이전 대화 비용을 이어받아 첫 result에 담으므로(11/8 재시작 직후 0턴 result가
+    # $118.16) 직전 누적이 없으면 이번 턴 몫을 알 수 없다. 새 대화의 첫 턴만 누적 전체가 이번 턴 몫이다
+    if data.get("modelUsage") and (prev_model_usage or not session.get("session_id")):
         # total_cost_usd는 프로세스 누적이라 이번 턴 몫은 직전 누적과의 차이로 구한다
         turn_cost = (_claude_model_usage_totals(data["modelUsage"])[1]
                      - _claude_model_usage_totals(prev_model_usage)[1])
@@ -3045,7 +3050,7 @@ async def _resume_channel_pending(channel_id: int, channel) -> bool:
         return False
     message = pending_list[-1].get("message")
     if message is None and channel is not None:
-        message = await channel.send("▶ 대기 요청을 이어서 처리합니다.")
+        message = await channel.send("▶ 대기 요청을 이어서 처리합니다.", **QUIET)
     if message is None:
         channel_pending[channel_id] = pending_list
         save_channel_pending()
@@ -3127,7 +3132,7 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
     status_msg = None
     if status_channel:
         try:
-            status_msg = await status_channel.send("🔧 Codex 실행 중...")
+            status_msg = await status_channel.send("🔧 Codex 실행 중...", **QUIET)
         except Exception:
             pass
 
@@ -3336,7 +3341,7 @@ async def run_codex(prompt: str, work_dir: str, channel_id: int = 0,
             if status_msg:
                 await status_msg.edit(content=text[:1900])
             else:
-                status_msg = await status_channel.send(text[:1900])
+                status_msg = await status_channel.send(text[:1900], **QUIET)
                 run_state["status_msg"] = status_msg
             channel_status[channel_id] = text
             last_status_edit = time.monotonic()
@@ -3656,7 +3661,7 @@ async def run_claude(prompt: str, work_dir: str, channel_id: int = 0,
             logger.warning(f"Claude API 오류, 재시도 {attempt + 1}/{MAX_RETRIES}: {result[:100]}")
             if status_channel:
                 try:
-                    await status_channel.send(f"⚠️ 응답 실패, 재시도 중... ({attempt + 1}/{MAX_RETRIES})")
+                    await status_channel.send(f"⚠️ 응답 실패, 재시도 중... ({attempt + 1}/{MAX_RETRIES})", **QUIET)
                 except Exception:
                     pass
             await asyncio.sleep(2)
@@ -3704,9 +3709,9 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
         if needs_spawn and status_channel:
             try:
                 if channel_sessions.get(channel_id):
-                    pre_spawn_msg = await status_channel.send("🔧 Claude 세션 복원 중... (수 초~수십 초 소요)")
+                    pre_spawn_msg = await status_channel.send("🔧 Claude 세션 복원 중... (수 초~수십 초 소요)", **QUIET)
                 else:
-                    pre_spawn_msg = await status_channel.send("🔧 Claude 프로세스 시작 중...")
+                    pre_spawn_msg = await status_channel.send("🔧 Claude 프로세스 시작 중...", **QUIET)
             except Exception:
                 pass
 
@@ -3755,6 +3760,7 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
             result_text = ""
             is_thinking = False        # thinking 블록 진행 중 여부
             compact_report = None      # 유휴 압축 뒤 첫 턴이면 압축 효과 보고
+            turn_stats = ""            # 답 뒤에 붙일 통계 한 줄
 
             if status_channel:
                 processing_text = (
@@ -3767,12 +3773,12 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
                         status_msg = pre_spawn_msg
                     except Exception:
                         try:
-                            status_msg = await status_channel.send(processing_text)
+                            status_msg = await status_channel.send(processing_text, **QUIET)
                         except Exception:
                             pass
                 else:
                     try:
-                        status_msg = await status_channel.send(processing_text)
+                        status_msg = await status_channel.send(processing_text, **QUIET)
                     except Exception:
                         pass
 
@@ -3794,7 +3800,7 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
                         if stream_msg:
                             await stream_msg.edit(content=_claude_preview(cut))
                         else:
-                            send_kwargs = dict(CLAUDE_REPLY_SEND_KWARGS)
+                            send_kwargs = {**CLAUDE_REPLY_SEND_KWARGS, **QUIET}
                             if reply_to:
                                 send_kwargs["reference"] = reply_to
                             stream_msg = await status_channel.send(_claude_preview(cut), **send_kwargs)
@@ -3809,7 +3815,7 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
                     if stream_msg:
                         await stream_msg.edit(content=_claude_preview(display))
                     elif display.strip():
-                        send_kwargs = dict(CLAUDE_REPLY_SEND_KWARGS)
+                        send_kwargs = {**CLAUDE_REPLY_SEND_KWARGS, **QUIET}
                         if reply_to and not stream_msgs:
                             send_kwargs["reference"] = reply_to
                         stream_msg = await status_channel.send(_claude_preview(display), **send_kwargs)
@@ -3870,7 +3876,7 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
                                     if status_msg:
                                         await status_msg.edit(content=status)
                                     else:
-                                        status_msg = await status_channel.send(status)
+                                        status_msg = await status_channel.send(status, **QUIET)
                                 except Exception:
                                     pass
 
@@ -3885,7 +3891,7 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
                                 if status_msg:
                                     await status_msg.edit(content=status)
                                 else:
-                                    status_msg = await status_channel.send(status)
+                                    status_msg = await status_channel.send(status, **QUIET)
                             except Exception:
                                 pass
                         elif block.get("type") == "tool_use":
@@ -3900,7 +3906,7 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
                                 if status_msg:
                                     await status_msg.edit(content=status)
                                 else:
-                                    status_msg = await status_channel.send(status)
+                                    status_msg = await status_channel.send(status, **QUIET)
                             except Exception:
                                 pass
 
@@ -3989,7 +3995,7 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
                                 if status_msg:
                                     await status_msg.edit(content=status)
                                 else:
-                                    status_msg = await status_channel.send(status)
+                                    status_msg = await status_channel.send(status, **QUIET)
                             except Exception:
                                 pass
 
@@ -4008,22 +4014,9 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
                     if data.get("modelUsage"):
                         session["model_usage"] = data["modelUsage"]
 
-                    if status_channel:
-                        stats = _claude_turn_stats(data, session, prev_model_usage)
-                        if stats:
-                            try:
-                                await status_channel.send(stats)
-                            except Exception:
-                                pass
-
+                    turn_stats = _claude_turn_stats(data, session, prev_model_usage)
                     if compact_report:
                         logger.info(f"채널 {channel_id}: {compact_report}")
-                        if status_channel:
-                            try:
-                                await status_channel.send(compact_report)
-                            except Exception:
-                                pass
-
                     break
 
                 if msg_type == "rate_limit_event":
@@ -4039,32 +4032,34 @@ async def _run_claude_once(prompt: str | None, work_dir: str, channel_id: int = 
                 except Exception:
                     pass
 
-            # 스트리밍 메시지를 최종 result로 교체
+            # 무음으로 보낸 스트리밍 메시지를 고치면 알림이 없으니, 최종 result는 새 메시지로 보내
+            # 알림이 답과 함께 한 번 가게 하고, 다 보냈을 때만 스트리밍 메시지를 지운다
             if result_text and status_channel:
-                final_chunks = split_markdown_message(_discord_markdown(result_text))
                 if stream_msg and stream_msg not in stream_msgs:
                     stream_msgs.append(stream_msg)
-
-                for i, content in enumerate(final_chunks):
-                    if i < len(stream_msgs):
-                        try:
-                            await stream_msgs[i].edit(content=content)
-                        except Exception:
-                            pass
-                    else:
-                        try:
-                            send_kwargs = dict(CLAUDE_REPLY_SEND_KWARGS)
-                            if reply_to and i == 0 and not stream_msgs:
-                                send_kwargs["reference"] = reply_to
-                            await status_channel.send(content, **send_kwargs)
-                        except Exception:
-                            pass
-
-                for i in range(len(final_chunks), len(stream_msgs)):
+                sent_all = True
+                for i, content in enumerate(split_markdown_message(_discord_markdown(result_text))):
                     try:
-                        await stream_msgs[i].delete()
+                        send_kwargs = dict(CLAUDE_REPLY_SEND_KWARGS)
+                        if reply_to and i == 0:
+                            send_kwargs["reference"] = reply_to
+                        await status_channel.send(content, **send_kwargs)
                     except Exception:
-                        pass
+                        sent_all = False
+                if sent_all:
+                    for msg in stream_msgs:
+                        try:
+                            await msg.delete()
+                        except Exception:
+                            pass
+
+            if status_channel:
+                for note in (turn_stats, compact_report):
+                    if note:
+                        try:
+                            await status_channel.send(note, **QUIET)
+                        except Exception:
+                            pass
 
             if new_session_id and channel_id:
                 channel_sessions[channel_id] = new_session_id
@@ -4732,7 +4727,7 @@ async def _run_deferred_codex_job(bot: commands.Bot, channel_id: int):
                 images = [path for item in pending_list for path in item.get("image_paths", [])]
                 pending_message = pending_list[-1].get("message")
                 if pending_message is None:
-                    pending_message = await channel.send("▶ 재시작 전 대기 요청을 이어서 처리합니다.")
+                    pending_message = await channel.send("▶ 재시작 전 대기 요청을 이어서 처리합니다.", **QUIET)
                 channel_busy[channel_id] = True
                 task = asyncio.create_task(_process_channel(
                     channel_id,
@@ -4828,7 +4823,7 @@ async def _process_channel(ch_id: int, prompt: str, message: discord.Message, im
                     all_images.extend(item.get("image_paths", []))
                 next_message = pending_list[-1].get("message")
                 if next_message is None:
-                    next_message = await message.channel.send("▶ 재시작 전 대기 요청을 이어서 처리합니다.")
+                    next_message = await message.channel.send("▶ 재시작 전 대기 요청을 이어서 처리합니다.", **QUIET)
                 message = next_message  # 마지막 메시지에 답장
                 prompt = "\n\n".join(all_prompts)
                 image_paths = all_images
@@ -5211,7 +5206,7 @@ async def _run_scheduled_job(bot: commands.Bot, job_id: str, job: dict):
                 pending_message = pending_list[-1].get("message")
                 if pending_message is None:
                     try:
-                        pending_message = await channel.send("▶ 예약 작업 후 대기 요청을 이어서 처리합니다.")
+                        pending_message = await channel.send("▶ 예약 작업 후 대기 요청을 이어서 처리합니다.", **QUIET)
                     except Exception as error:
                         channel_pending[ch_id] = pending_list + channel_pending.get(ch_id, [])
                         save_channel_pending()
@@ -5251,7 +5246,7 @@ async def _resume_persisted_channel_pending(bot: commands.Bot):
                 message = None
         if message is None:
             try:
-                message = await channel.send("▶ 봇 재시작 전 대기 요청을 이어서 처리합니다.")
+                message = await channel.send("▶ 봇 재시작 전 대기 요청을 이어서 처리합니다.", **QUIET)
             except Exception as e:
                 logger.warning(f"채널 {channel_id}: 저장된 대기열 안내 실패: {e}")
                 channel_pending[channel_id] = restored

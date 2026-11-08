@@ -40,6 +40,15 @@ class ClaudeTurnStatsTests(unittest.TestCase):
 
         self.assertEqual(stats, "💰 $0.005 (세션 $0.005) 📊 입력 29.5k (캐시 읽기 99%) → 출력 4")
 
+    def test_resumed_process_without_baseline_shows_only_session_total(self):
+        # 재시작 뒤 --resume으로 뜬 프로세스의 첫 result (11/8 실제 값)
+        data = {"total_cost_usd": 118.16, "duration_ms": 200, "num_turns": 0,
+                "modelUsage": _model_usage(118.16)}
+
+        stats = bot._claude_turn_stats(data, {"session_id": "1fe331b9"}, None)
+
+        self.assertEqual(stats, "(세션 $118.16) ⏱️ 0.2s 🔄 0턴")
+
     def test_error_result_without_usage_is_empty(self):
         self.assertEqual(bot._claude_turn_stats({"is_error": True}, {}, None), "")
 
