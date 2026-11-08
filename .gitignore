@@ -22,6 +22,7 @@ scheduled_jobs.json
 WorkMD/
 .claude/
 .agents/
-AGENTS.md
+# 개인 정보가 든 이전 AGENTS.md 보관본 (AGENTS.md 자체는 추적)
+AGENTS.archive.md
 venv*/
 *.png
